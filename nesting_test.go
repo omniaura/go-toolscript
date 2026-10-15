@@ -3,6 +3,7 @@ package toolscript
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"reflect"
@@ -148,6 +149,23 @@ func TestDeepJSONParseIsBounded(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "max depth") {
 		t.Fatalf("got err=%v, want a depth-bounded SyntaxError", err)
+	}
+}
+
+// TestJSONParseDepthGuardIsOwn pins decodeToken's own bound independently of
+// the standard library. On Go 1.27 json.Decoder rejects the same 10000 levels
+// itself, so TestDeepJSONParseIsBounded passes there even without the guard;
+// starting the decoder one level short of the bound makes a three-level input
+// cross it, which no toolchain's decoder rejects.
+func TestJSONParseDepthGuardIsOwn(t *testing.T) {
+	r := &rt{ctx: context.Background(), x: &execution{maxString: 1 << 20, maxItems: 1 << 20}}
+	_, err := r.decodeJSON(json.NewDecoder(strings.NewReader("[[1]]")), maxConversionNesting-1)
+	if err == nil || err.Error() != "exceeded max depth" {
+		t.Fatalf("got err=%v, want decodeToken's exceeded max depth", err)
+	}
+	v, err := r.decodeJSON(json.NewDecoder(strings.NewReader("[1]")), maxConversionNesting-1)
+	if err != nil || !reflect.DeepEqual(v, &array{items: []any{float64(1)}}) {
+		t.Fatalf("got value=%#v err=%v, want [1] at the last allowed level", v, err)
 	}
 }
 
