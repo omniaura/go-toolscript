@@ -214,7 +214,7 @@ func (r *rt) newArray(items []any) (any, error) {
 	if len(items) > r.x.maxItems {
 		return nil, r.rangeError("Invalid array length")
 	}
-	return &array{items: items}, nil
+	return r.arrayValue(items)
 }
 
 func init() {
@@ -234,7 +234,22 @@ func init() {
 			return unhole(a.items[n]), nil
 		},
 		"concat": func(r *rt, a *array, args []any) (any, error) {
-			out := append([]any(nil), a.items...)
+			n := len(a.items)
+			for _, v := range args {
+				if b, ok := v.(*array); ok {
+					n += len(b.items)
+				} else {
+					n++
+				}
+			}
+			if n > r.x.maxItems {
+				return nil, r.rangeError("Invalid array length")
+			}
+			if err := r.chargeArray(n); err != nil {
+				return nil, err
+			}
+			out := make([]any, 0, n)
+			out = append(out, a.items...)
 			for _, v := range args {
 				if b, ok := v.(*array); ok {
 					out = append(out, b.items...)
@@ -242,7 +257,7 @@ func init() {
 					out = append(out, v)
 				}
 			}
-			return r.newArray(nonNil(out))
+			return &array{items: out}, nil
 		},
 		"every": func(r *rt, a *array, args []any) (any, error) {
 			return iterateArray(r, a, args, func(v, res any, i int) (any, bool) {
@@ -301,6 +316,9 @@ func init() {
 				return nil, err
 			}
 			n := len(a.items)
+			if err := r.chargeArray(n); err != nil {
+				return nil, err
+			}
 			out := make([]any, n)
 			for i := range out {
 				out[i] = hole
@@ -322,6 +340,9 @@ func init() {
 			if err := r.requireCallable(f); err != nil {
 				return nil, err
 			}
+			if err := r.chargeArray(0); err != nil {
+				return nil, err
+			}
 			out := []any{}
 			n := len(a.items)
 			for i := 0; i < n && i < len(a.items); i++ {
@@ -334,6 +355,9 @@ func init() {
 					return nil, err
 				}
 				if toBoolean(keep) {
+					if err := r.charge(allocSlot); err != nil {
+						return nil, err
+					}
 					out = append(out, v)
 				}
 			}
@@ -348,6 +372,9 @@ func init() {
 				}
 				depth = toIntegerOrInfinity(d)
 			}
+			if err := r.chargeArray(0); err != nil {
+				return nil, err
+			}
 			out := []any{}
 			if err := r.flatten(&out, a.items, depth, 0); err != nil {
 				return nil, err
@@ -357,6 +384,9 @@ func init() {
 		"flatMap": func(r *rt, a *array, args []any) (any, error) {
 			f := arg(args, 0)
 			if err := r.requireCallable(f); err != nil {
+				return nil, err
+			}
+			if err := r.chargeArray(0); err != nil {
 				return nil, err
 			}
 			out := []any{}
@@ -370,8 +400,17 @@ func init() {
 					return nil, err
 				}
 				if b, ok := v.(*array); ok {
+					if len(out)+len(b.items) > r.x.maxItems {
+						return nil, r.rangeError("Invalid array length")
+					}
+					if err := r.charge(len(b.items) * allocSlot); err != nil {
+						return nil, err
+					}
 					out = append(out, b.items...)
 				} else {
+					if err := r.charge(allocSlot); err != nil {
+						return nil, err
+					}
 					out = append(out, v)
 				}
 				if len(out) > r.x.maxItems {
@@ -436,9 +475,9 @@ func init() {
 			return r.join(a, sep)
 		},
 		"toString": func(r *rt, a *array, args []any) (any, error) { return r.join(a, ",") },
-		"entries":  func(r *rt, a *array, args []any) (any, error) { return arrayIterator(a, "entries"), nil },
-		"keys":     func(r *rt, a *array, args []any) (any, error) { return arrayIterator(a, "keys"), nil },
-		"values":   func(r *rt, a *array, args []any) (any, error) { return arrayIterator(a, "values"), nil },
+		"entries":  func(r *rt, a *array, args []any) (any, error) { return r.iteratorValue(arrayIterator(a, "entries")) },
+		"keys":     func(r *rt, a *array, args []any) (any, error) { return r.iteratorValue(arrayIterator(a, "keys")) },
+		"values":   func(r *rt, a *array, args []any) (any, error) { return r.iteratorValue(arrayIterator(a, "values")) },
 		"toLocaleString": func(r *rt, a *array, args []any) (any, error) {
 			// A nested array converts through this method again, and a cyclic
 			// array would recurse forever, so it shares join's cycle guard and
@@ -477,6 +516,9 @@ func init() {
 			if len(a.items)+len(args) > r.x.maxItems {
 				return nil, r.rangeError("Invalid array length")
 			}
+			if err := r.growArray(a, len(a.items)+len(args)); err != nil {
+				return nil, err
+			}
 			a.items = append(a.items, args...)
 			return float64(len(a.items)), nil
 		},
@@ -491,6 +533,9 @@ func init() {
 		"unshift": func(r *rt, a *array, args []any) (any, error) {
 			if len(a.items)+len(args) > r.x.maxItems {
 				return nil, r.rangeError("Invalid array length")
+			}
+			if err := r.growArray(a, len(a.items)+len(args)); err != nil {
+				return nil, err
 			}
 			a.items = append(append([]any(nil), args...), a.items...)
 			return float64(len(a.items)), nil
@@ -508,6 +553,9 @@ func init() {
 			return a, nil
 		},
 		"toReversed": func(r *rt, a *array, args []any) (any, error) {
+			if err := r.chargeArray(len(a.items)); err != nil {
+				return nil, err
+			}
 			out := make([]any, len(a.items))
 			for i, v := range a.items {
 				out[len(out)-1-i] = unhole(v)
@@ -525,7 +573,10 @@ func init() {
 				return nil, err
 			}
 			if start >= end {
-				return &array{items: []any{}}, nil
+				return r.arrayValue([]any{})
+			}
+			if err := r.chargeArray(end - start); err != nil {
+				return nil, err
 			}
 			return &array{items: append([]any(nil), a.items[start:end]...)}, nil
 		},
@@ -536,6 +587,9 @@ func init() {
 			return a, nil
 		},
 		"toSorted": func(r *rt, a *array, args []any) (any, error) {
+			if err := r.chargeArray(len(a.items)); err != nil {
+				return nil, err
+			}
 			out := append([]any(nil), denseItems(a.items)...)
 			if err := r.sortItems(out, arg(args, 0)); err != nil {
 				return nil, err
@@ -550,6 +604,9 @@ func init() {
 			return removed, nil
 		},
 		"toSpliced": func(r *rt, a *array, args []any) (any, error) {
+			if err := r.chargeArray(len(a.items)); err != nil {
+				return nil, err
+			}
 			c := &array{items: append([]any(nil), denseItems(a.items)...)}
 			if _, err := r.splice(c, args, false); err != nil {
 				return nil, err
@@ -583,6 +640,9 @@ func init() {
 			}
 			if i < 0 || i >= len(a.items) {
 				return nil, r.rangeError("Invalid index " + numberToString(toIntegerOrInfinity(f)))
+			}
+			if err := r.chargeArray(len(a.items)); err != nil {
+				return nil, err
 			}
 			out := append([]any(nil), denseItems(a.items)...)
 			out[i] = arg(args, 1)
@@ -658,7 +718,10 @@ func init() {
 				}
 				b.WriteString(t)
 			}
-			return r.checkString(b.String())
+			if _, err := r.checkString(b.String()); err != nil {
+				return nil, err
+			}
+			return r.stringValue(b.String())
 		},
 		"endsWith": func(r *rt, s string, args []any) (any, error) {
 			if _, ok := arg(args, 0).(*regexpValue); ok {
@@ -760,6 +823,9 @@ func init() {
 			if float64(len(s))*n > float64(r.x.maxString) {
 				return nil, r.rangeError("Invalid string length")
 			}
+			if err := r.charge(len(s)*int(n) + allocSlot); err != nil {
+				return nil, err
+			}
 			return strings.Repeat(s, int(n)), nil
 		},
 		"replace": func(r *rt, s string, args []any) (any, error) {
@@ -798,7 +864,7 @@ func init() {
 			if err != nil {
 				return nil, err
 			}
-			return utf16Slice(s, start, end), nil
+			return r.slice16(s, start, end)
 		},
 		"substring": func(r *rt, s string, args []any) (any, error) {
 			l := utf16Len(s)
@@ -815,7 +881,7 @@ func init() {
 			if start > end {
 				start, end = end, start
 			}
-			return utf16Slice(s, start, end), nil
+			return r.slice16(s, start, end)
 		},
 		"substr": func(r *rt, s string, args []any) (any, error) {
 			l := utf16Len(s)
@@ -834,11 +900,15 @@ func init() {
 			if length <= 0 {
 				return "", nil
 			}
-			return utf16Slice(s, start, start+int(length)), nil
+			return r.slice16(s, start, start+int(length))
 		},
 		"split": func(r *rt, s string, args []any) (any, error) {
 			if rx, ok := arg(args, 0).(*regexpValue); ok {
-				return r.stringSplitRegexp(s, rx, arg(args, 1))
+				v, err := r.stringSplitRegexp(s, rx, arg(args, 1))
+				if err != nil {
+					return nil, err
+				}
+				return v, r.chargeFresh(v)
 			}
 			limit := -1
 			if v := arg(args, 1); !isUndefined(v) {
@@ -849,10 +919,10 @@ func init() {
 				limit = int(toUint32(f))
 			}
 			if limit == 0 {
-				return &array{items: []any{}}, nil
+				return r.arrayValue([]any{})
 			}
 			if isUndefined(arg(args, 0)) {
-				return &array{items: []any{s}}, nil
+				return r.arrayValue([]any{s})
 			}
 			sep, err := r.toString(arg(args, 0))
 			if err != nil {
@@ -869,11 +939,7 @@ func init() {
 			if len(parts) > r.x.maxItems {
 				return nil, r.rangeError("Invalid array length")
 			}
-			out := make([]any, len(parts))
-			for i, p := range parts {
-				out[i] = p
-			}
-			return &array{items: out}, nil
+			return r.stringsValue(parts)
 		},
 		"localeCompare": func(r *rt, s string, args []any) (any, error) {
 			that, err := r.toString(arg(args, 0))
@@ -883,10 +949,10 @@ func init() {
 			return float64(r.collator().CompareString(norm.NFD.String(s), norm.NFD.String(that))), nil
 		},
 		"toLocaleString":    func(r *rt, s string, _ []any) (any, error) { return s, nil },
-		"toLowerCase":       func(r *rt, s string, _ []any) (any, error) { return toLowerJS(s), nil },
-		"toLocaleLowerCase": func(r *rt, s string, _ []any) (any, error) { return toLowerJS(s), nil },
-		"toUpperCase":       func(r *rt, s string, _ []any) (any, error) { return toUpperJS(s), nil },
-		"toLocaleUpperCase": func(r *rt, s string, _ []any) (any, error) { return toUpperJS(s), nil },
+		"toLowerCase":       func(r *rt, s string, _ []any) (any, error) { return r.stringValue(toLowerJS(s)) },
+		"toLocaleLowerCase": func(r *rt, s string, _ []any) (any, error) { return r.stringValue(toLowerJS(s)) },
+		"toUpperCase":       func(r *rt, s string, _ []any) (any, error) { return r.stringValue(toUpperJS(s)) },
+		"toLocaleUpperCase": func(r *rt, s string, _ []any) (any, error) { return r.stringValue(toUpperJS(s)) },
 		"toString":          func(r *rt, s string, _ []any) (any, error) { return s, nil },
 		"valueOf":           func(r *rt, s string, _ []any) (any, error) { return s, nil },
 		"trim":              func(r *rt, s string, _ []any) (any, error) { return trimJS(s), nil },
@@ -906,7 +972,7 @@ func init() {
 			if d < 0 || d > 100 {
 				return nil, r.rangeError("toFixed() precision must be between 0 and 100")
 			}
-			return toFixed(f, int(d)), nil
+			return r.stringValue(toFixed(f, int(d)))
 		},
 		"toString": func(r *rt, f float64, args []any) (any, error) {
 			radix := 10.0
@@ -924,16 +990,20 @@ func init() {
 			if !ok {
 				return nil, errRuntimeUnsupported("fractional Number.prototype.toString radix")
 			}
-			return s, nil
+			return r.stringValue(s)
 		},
 		"valueOf": func(r *rt, f float64, _ []any) (any, error) { return f, nil },
 		// Goja formats numbers for every locale like toString; with locales
 		// or options it is Intl.NumberFormat.
 		"toLocaleString": func(r *rt, f float64, args []any) (any, error) {
 			if isUndefined(arg(args, 0)) && isUndefined(arg(args, 1)) {
-				return numberToString(f), nil
+				return r.stringValue(numberToString(f))
 			}
-			return r.numberToLocaleString(f, arg(args, 0), arg(args, 1))
+			v, err := r.numberToLocaleString(f, arg(args, 0), arg(args, 1))
+			if err != nil {
+				return nil, err
+			}
+			return v, r.chargeFresh(v)
 		},
 		"toPrecision": func(r *rt, f float64, args []any) (any, error) {
 			if isUndefined(arg(args, 0)) {
@@ -951,7 +1021,7 @@ func init() {
 				return nil, r.rangeError("toPrecision() precision must be between 1 and 100")
 			}
 			var buf [128]byte
-			return string(ftoa.FToStr(f, ftoa.ModePrecision, int(p), buf[:0])), nil
+			return r.stringValue(string(ftoa.FToStr(f, ftoa.ModePrecision, int(p), buf[:0])))
 		},
 	}
 
@@ -971,12 +1041,7 @@ func init() {
 			if err != nil {
 				return nil, err
 			}
-			keys := ownEnumerableKeys(o)
-			out := make([]any, len(keys))
-			for i, k := range keys {
-				out[i] = k
-			}
-			return &array{items: out}, nil
+			return r.stringsValue(ownEnumerableKeys(o))
 		},
 		"Object.values": func(r *rt, args []any) (any, error) {
 			o, err := r.toObjectArg(arg(args, 0))
@@ -984,6 +1049,9 @@ func init() {
 				return nil, err
 			}
 			keys := ownEnumerableKeys(o)
+			if err := r.chargeArray(len(keys)); err != nil {
+				return nil, err
+			}
 			out := make([]any, len(keys))
 			for i, k := range keys {
 				if out[i], err = r.getProp(o, k); err != nil {
@@ -998,6 +1066,14 @@ func init() {
 				return nil, err
 			}
 			keys := ownEnumerableKeys(o)
+			n := allocHeader
+			for _, k := range keys {
+				// Each entry is a [key, value] array holding the key string.
+				n += allocSlot + allocHeader + 2*allocSlot + len(k) + allocSlot
+			}
+			if err := r.charge(n); err != nil {
+				return nil, err
+			}
 			out := make([]any, len(keys))
 			for i, k := range keys {
 				v, err := r.getProp(o, k)
@@ -1031,7 +1107,10 @@ func init() {
 			if err != nil {
 				return nil, err
 			}
-			o := newObject(len(items))
+			o, err := r.newObj(0)
+			if err != nil {
+				return nil, err
+			}
 			for _, e := range items {
 				if !isObjectValue(e) {
 					s, _ := r.toString(e)
@@ -1049,7 +1128,9 @@ func init() {
 				if err != nil {
 					return nil, err
 				}
-				o.set(key, v)
+				if err := r.put(o, key, v); err != nil {
+					return nil, err
+				}
 			}
 			return o, nil
 		},
@@ -1082,6 +1163,9 @@ func init() {
 				// is produced, and a partially consumed iterator yields
 				// only what is left.
 				it, _ := defaultIterator(t)
+				if err := r.chargeArray(0); err != nil {
+					return nil, err
+				}
 				items = []any{}
 				for {
 					v, ok := it.next()
@@ -1090,6 +1174,9 @@ func init() {
 					}
 					if len(items) >= r.x.maxItems {
 						return nil, r.rangeError("Invalid array length")
+					}
+					if err := r.charge(allocSlot + it.cost); err != nil {
+						return nil, err
 					}
 					if !isUndefined(mapFn) {
 						m, err := r.callback(mapFn, v, float64(len(items)))
@@ -1102,10 +1189,16 @@ func init() {
 				}
 				return &array{items: items}, nil
 			case *array:
+				if err := r.chargeArray(len(t.items)); err != nil {
+					return nil, err
+				}
 				items = append([]any(nil), t.items...)
 			case string:
 				var err error
 				if items, err = r.iterableItems(t); err != nil {
+					return nil, err
+				}
+				if err := r.chargeArray(len(items)); err != nil {
 					return nil, err
 				}
 			case *object:
@@ -1118,6 +1211,9 @@ func init() {
 				if n > float64(r.x.maxItems) {
 					return nil, r.rangeError("Invalid array length")
 				}
+				if err := r.chargeArray(int(n)); err != nil {
+					return nil, err
+				}
 				items = make([]any, int(n))
 				for i := range items {
 					if items[i], err = r.getProp(t, strconv.Itoa(i)); err != nil {
@@ -1127,6 +1223,9 @@ func init() {
 			case nil, undefined:
 				return nil, r.typeError("Cannot convert undefined or null to object")
 			default:
+				if err := r.chargeArray(0); err != nil {
+					return nil, err
+				}
 				items = []any{}
 			}
 			if f := mapFn; !isUndefined(f) {
@@ -1167,7 +1266,7 @@ func init() {
 				}
 				u[i] = uint16(toUint32(f))
 			}
-			return fromUnits(u), nil
+			return r.stringValue(fromUnits(u))
 		},
 		"Math.max": func(r *rt, args []any) (any, error) { return r.minMax(args, true) },
 		"Math.min": func(r *rt, args []any) (any, error) { return r.minMax(args, false) },
@@ -1424,6 +1523,9 @@ func (r *rt) flatten(out *[]any, items []any, depth float64, nesting int) error 
 			}
 			continue
 		}
+		if err := r.charge(allocSlot); err != nil {
+			return err
+		}
 		*out = append(*out, v)
 		if len(*out) > r.x.maxItems {
 			return r.rangeError("Invalid array length")
@@ -1586,6 +1688,14 @@ func (r *rt) splice(a *array, args []any, returnRemoved bool) (any, error) {
 	if n-del+len(insert) > r.x.maxItems {
 		return nil, r.rangeError("Invalid array length")
 	}
+	if returnRemoved {
+		if err := r.chargeArray(del); err != nil {
+			return nil, err
+		}
+	}
+	if err := r.growArray(a, n-del+len(insert)); err != nil {
+		return nil, err
+	}
 	removed := append([]any{}, a.items[start:start+del]...)
 	out := make([]any, 0, n-del+len(insert))
 	out = append(out, a.items[:start]...)
@@ -1616,6 +1726,10 @@ func (r *rt) pad(s string, args []any, start bool) (any, error) {
 	}
 	if target > float64(r.x.maxString) {
 		return nil, r.rangeError("Invalid string length")
+	}
+	// UTF-8 can take up to 3 bytes for each UTF-16 code unit of padding.
+	if err := r.charge(len(s) + 3*(int(target)-l) + allocSlot); err != nil {
+		return nil, err
 	}
 	need := int(target) - l
 	fu := toUnits(fill)
@@ -1691,7 +1805,7 @@ func (r *rt) replace(s string, args []any, all bool) (any, error) {
 		}
 	}
 	b.WriteString(fromUnits(u[last:]))
-	return b.String(), nil
+	return r.stringValue(b.String())
 }
 
 // expandReplacement applies GetSubstitution for a string pattern.
@@ -1733,7 +1847,17 @@ func (r *rt) callGlobal(name string, args []any) (any, error) {
 		if len(args) == 0 {
 			return "", nil
 		}
-		return r.toString(args[0])
+		s, err := r.toString(args[0])
+		if err != nil {
+			return nil, err
+		}
+		switch args[0].(type) {
+		case float64, *dateValue:
+			// A fresh rendering; other conversions charge where they build
+			// (join, Error.prototype.toString) or return existing text.
+			return r.stringValue(s)
+		}
+		return s, nil
 	case "Number":
 		if len(args) == 0 {
 			return 0.0, nil
@@ -1774,7 +1898,7 @@ func (r *rt) callGlobal(name string, args []any) (any, error) {
 		if name == "encodeURI" {
 			keep = uriReserved
 		}
-		return uriEncode(s, keep), nil
+		return r.stringValue(uriEncode(s, keep))
 	case "decodeURIComponent", "decodeURI":
 		s, err := r.toString(arg(args, 0))
 		if err != nil {
@@ -1784,7 +1908,11 @@ func (r *rt) callGlobal(name string, args []any) (any, error) {
 		if name == "decodeURI" {
 			preserve = uriReserved
 		}
-		return r.uriDecode(s, preserve)
+		out, err := r.uriDecode(s, preserve)
+		if err != nil {
+			return nil, err
+		}
+		return r.stringValue(out)
 	}
 	return nil, errInternal
 }
@@ -1801,7 +1929,11 @@ func (r *rt) console(level string, args []any) error {
 	}
 	line := strings.Join(parts, " ")
 	if r.seq != nil {
-		// Parallel batch item: released in item order by the sequencer.
+		// Parallel batch item: released in item order by the sequencer, so
+		// the line is held until then.
+		if err := r.chargeString(line); err != nil {
+			return err
+		}
 		r.logs = append(r.logs, consoleLine{level, line})
 		return nil
 	}

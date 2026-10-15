@@ -27,6 +27,7 @@ type object struct {
 type array struct {
 	items []any
 	props *object // named own properties (exec results carry index/input/groups)
+	hw    int     // the most elements charged for growing it in place (growArray)
 }
 
 // function is a user closure or a built-in (native != nil).
@@ -422,7 +423,11 @@ func (r *rt) toString(v any) (string, error) {
 	case *hostObject:
 		return "[object Object]", nil
 	case *regexpValue:
-		return "/" + v.pat.source + "/" + v.pat.flags, nil
+		s := "/" + v.pat.source + "/" + v.pat.flags
+		if err := r.chargeString(s); err != nil {
+			return "", err
+		}
+		return s, nil
 	case *collection:
 		if v.isMap {
 			return "[object Map]", nil
@@ -436,7 +441,15 @@ func (r *rt) toString(v any) (string, error) {
 		return r.dateString(v, dateTimeLayout, false), nil
 	case *function:
 		if v.native != nil {
-			return "function " + v.displayName() + "() { [native code] }", nil
+			s := "function " + v.displayName() + "() { [native code] }"
+			if v.binds > 0 {
+				// displayName repeats "bound " per bind level: up to
+				// maxBindNesting of them, built afresh on every conversion.
+				if err := r.chargeString(s); err != nil {
+					return "", err
+				}
+			}
+			return s, nil
 		}
 		return v.code.source, nil
 	}
@@ -518,7 +531,11 @@ func (r *rt) join(a *array, sep string) (string, error) {
 			return "", r.rangeError("Invalid string length")
 		}
 	}
-	return b.String(), nil
+	out := b.String()
+	if err := r.chargeString(out); err != nil {
+		return "", err
+	}
+	return out, nil
 }
 
 func (r *rt) toNumber(v any) (float64, error) {
@@ -698,13 +715,21 @@ func (r *rt) getProp(v any, key string) (any, error) {
 	switch v := v.(type) {
 	case *object:
 		if p, ok := v.get(key); ok {
+			if s, isString := p.(string); isString && key == "stack" && v.errName != "" {
+				if _, own := v.own(key); !own {
+					// Error.prototype.stack renders afresh on every read.
+					if err := r.chargeString(s); err != nil {
+						return nil, err
+					}
+				}
+			}
 			return p, nil
 		}
 		ctor := "Object"
 		if v.errName != "" {
 			ctor = v.errName
 		}
-		if p, ok, err := inherited(key, ctor); ok {
+		if p, ok, err := r.inherited(key, ctor); ok {
 			return p, err
 		}
 		return Undefined, nil
@@ -726,7 +751,7 @@ func (r *rt) getProp(v any, key string) (any, error) {
 		if f := protoFn("Array", key); f != nil {
 			return f, nil
 		}
-		if p, ok, err := inherited(key, "Array"); ok {
+		if p, ok, err := r.inherited(key, "Array"); ok {
 			return p, err
 		}
 		return Undefined, nil
@@ -737,7 +762,7 @@ func (r *rt) getProp(v any, key string) (any, error) {
 		if p, ok := collectionMember(v, key); ok {
 			return p, nil
 		}
-		if p, ok, err := inherited(key, "Object"); ok {
+		if p, ok, err := r.inherited(key, "Object"); ok {
 			return p, err
 		}
 		return Undefined, nil
@@ -750,7 +775,7 @@ func (r *rt) getProp(v any, key string) (any, error) {
 		if f := protoFn("Date", key); f != nil {
 			return f, nil
 		}
-		if p, ok, err := inherited(key, "Date"); ok {
+		if p, ok, err := r.inherited(key, "Date"); ok {
 			return p, err
 		}
 		return Undefined, nil
@@ -758,7 +783,7 @@ func (r *rt) getProp(v any, key string) (any, error) {
 		if p, ok := r.intlMember(v, key); ok {
 			return p, nil
 		}
-		if p, ok, err := inherited(key, "Object"); ok {
+		if p, ok, err := r.inherited(key, "Object"); ok {
 			return p, err
 		}
 		return Undefined, nil
@@ -766,7 +791,7 @@ func (r *rt) getProp(v any, key string) (any, error) {
 		if f := protoFn("Iterator", key); f != nil {
 			return f, nil
 		}
-		if p, ok, err := inherited(key, "Object"); ok {
+		if p, ok, err := r.inherited(key, "Object"); ok {
 			return p, err
 		}
 		return Undefined, nil
@@ -794,7 +819,7 @@ func (r *rt) getProp(v any, key string) (any, error) {
 		if f := protoFn("String", key); f != nil {
 			return f, nil
 		}
-		if p, ok, err := inherited(key, "String"); ok {
+		if p, ok, err := r.inherited(key, "String"); ok {
 			return p, err
 		}
 		return Undefined, nil
@@ -804,7 +829,7 @@ func (r *rt) getProp(v any, key string) (any, error) {
 		if f := protoFn("Number", key); f != nil {
 			return f, nil
 		}
-		if p, ok, err := inherited(key, "Number"); ok {
+		if p, ok, err := r.inherited(key, "Number"); ok {
 			return p, err
 		}
 		return Undefined, nil
@@ -812,7 +837,7 @@ func (r *rt) getProp(v any, key string) (any, error) {
 		if f := protoFn("Boolean", key); f != nil {
 			return f, nil
 		}
-		if p, ok, err := inherited(key, "Boolean"); ok {
+		if p, ok, err := r.inherited(key, "Boolean"); ok {
 			return p, err
 		}
 		return Undefined, nil
@@ -824,6 +849,10 @@ func (r *rt) getProp(v any, key string) (any, error) {
 		}
 		switch key {
 		case "name":
+			if v.binds > 0 {
+				// Built afresh on every read (see displayName).
+				return r.stringValue(v.displayName())
+			}
 			return v.displayName(), nil
 		case "length":
 			if v.code != nil {
@@ -846,8 +875,7 @@ func (r *rt) setProp(target any, key string, v any) error {
 		if key == "__proto__" {
 			return errRuntimeUnsupported("__proto__ assignment")
 		}
-		t.set(key, v)
-		return nil
+		return r.put(t, key, v)
 	case *array:
 		if key == "length" {
 			n, err := r.toNumber(v)
@@ -868,11 +896,7 @@ func (r *rt) setProp(target any, key string, v any) error {
 			t.items[i] = v
 			return nil
 		}
-		if t.props == nil {
-			t.props = newObject(1)
-		}
-		t.props.set(key, v)
-		return nil
+		return r.putOwn(&t.props, key, v)
 	case *regexpValue:
 		if key == "lastIndex" {
 			t.lastIndex = v
@@ -881,41 +905,41 @@ func (r *rt) setProp(target any, key string, v any) error {
 		if _, accessor := t.get(key); accessor {
 			return nil // prototype accessors without a setter ignore writes
 		}
-		return setOwnProp(&t.props, key, v)
+		return r.setOwnProp(&t.props, key, v)
 	case *collection:
 		if key == "size" {
 			return nil // prototype accessor without a setter
 		}
-		return setOwnProp(&t.props, key, v)
+		return r.setOwnProp(&t.props, key, v)
 	case *dateValue:
-		if t.props == nil {
-			t.props = newObject(1)
-		}
-		t.props.set(key, v)
-		return nil
+		return r.putOwn(&t.props, key, v)
 	case *intlObject:
-		if t.props == nil {
-			t.props = newObject(1)
-		}
-		t.props.set(key, v)
-		return nil
+		return r.putOwn(&t.props, key, v)
 	case *hostObject:
 		t.dirty = true
-		t.view.set(key, v)
-		return nil
+		return r.put(t.view, key, v)
 	case nil, undefined:
 		return r.typeError("Cannot convert undefined or null to object")
 	case *function:
 		if t.native != nil || key == "name" || key == "length" {
 			return nil // built-ins and read-only function properties ignore writes
 		}
-		if t.props == nil {
-			t.props = newObject(1)
-		}
-		t.props.set(key, v)
-		return nil
+		return r.putOwn(&t.props, key, v)
 	}
 	return nil // primitives silently ignore writes in sloppy mode
+}
+
+// putOwn writes a script-assigned property into an optional bag, creating
+// and charging for the bag on first use.
+func (r *rt) putOwn(props **object, key string, v any) error {
+	if *props == nil {
+		o, err := r.newObj(1)
+		if err != nil {
+			return err
+		}
+		*props = o
+	}
+	return r.put(*props, key, v)
 }
 
 // maxHoles bounds sparse growth: Goja stores huge sparse arrays lazily, so a
@@ -928,6 +952,9 @@ func (r *rt) resize(a *array, n int) error {
 	}
 	if n-len(a.items) > maxHoles {
 		return errRuntimeUnsupported("sparse array growth")
+	}
+	if err := r.growArray(a, n); err != nil {
+		return err
 	}
 	for len(a.items) < n {
 		a.items = append(a.items, hole)
@@ -1121,11 +1148,15 @@ func init() {
 }
 
 // inherited returns a prototype member for a missing own key, if any.
-func inherited(key, ctor string) (any, bool, error) {
+func (r *rt) inherited(key, ctor string) (any, bool, error) {
 	if key == "__proto__" {
 		// The prototype object itself is not modelled; a fresh empty object
 		// answers typeof/keys/property reads the way Object.prototype would.
-		return newObject(0), true, nil
+		o, err := r.newObj(0)
+		if err != nil {
+			return nil, true, err
+		}
+		return o, true, nil
 	}
 	if objectProtoMember(key) {
 		return protoFunction(key, ctor), true, nil
@@ -1150,13 +1181,9 @@ func ownProp(props *object, key string) (any, bool) {
 }
 
 // setOwnProp writes a script-assigned own property, creating the bag.
-func setOwnProp(props **object, key string, v any) error {
+func (r *rt) setOwnProp(props **object, key string, v any) error {
 	if key == "__proto__" {
 		return errRuntimeUnsupported("__proto__ assignment")
 	}
-	if *props == nil {
-		*props = newObject(1)
-	}
-	(*props).set(key, v)
-	return nil
+	return r.putOwn(props, key, v)
 }

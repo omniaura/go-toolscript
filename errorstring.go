@@ -55,7 +55,11 @@ func (r *rt) errorString(o *object) (string, error) {
 	case len(ns)+len(": ")+len(ms) > r.x.maxString:
 		return "", r.rangeError("Invalid string length")
 	}
-	return ns + ": " + ms, nil
+	s := ns + ": " + ms
+	if err := r.chargeString(s); err != nil {
+		return "", err
+	}
+	return s, nil
 }
 
 // The detached formatter renders values the way String() does for the callers

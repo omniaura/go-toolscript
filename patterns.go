@@ -151,6 +151,9 @@ func (c *compiler) arrayPattern(n *ast.ArrayPattern, init bool) (binder, error) 
 		if rest != nil {
 			var tail []any
 			if len(items) > len(elems) {
+				if err := r.chargeArray(len(items) - len(elems)); err != nil {
+					return err
+				}
 				tail = append(tail, items[len(elems):]...)
 			}
 			return rest(r, s, &array{items: nonNil(tail)})
@@ -173,6 +176,11 @@ func (r *rt) iterableItems(v any) ([]any, error) {
 	case *array:
 		return denseItems(t.items), nil
 	case string:
+		// One slot per code point, at most one per byte; each holds a
+		// string of at most 4 bytes.
+		if err := r.charge(len(t) * allocSlot); err != nil {
+			return nil, err
+		}
 		out := make([]any, 0, len(t))
 		for _, ch := range t {
 			out = append(out, string(ch))
@@ -285,7 +293,10 @@ func (c *compiler) objectPattern(n *ast.ObjectPattern, init bool) (binder, error
 			}
 		}
 		if rest != nil {
-			out := newObject(0)
+			out, err := r.newObj(0)
+			if err != nil {
+				return err
+			}
 			for _, k := range ownEnumerableKeys(v) {
 				if used[k] {
 					continue
@@ -294,7 +305,9 @@ func (c *compiler) objectPattern(n *ast.ObjectPattern, init bool) (binder, error
 				if err != nil {
 					return err
 				}
-				out.set(k, val)
+				if err := r.put(out, k, val); err != nil {
+					return err
+				}
 			}
 			return rest(r, s, out)
 		}

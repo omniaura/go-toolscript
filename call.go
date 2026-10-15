@@ -482,6 +482,10 @@ func (c *compiler) batch(kind string, n *ast.CallExpression) (evalFn, error) {
 			items[i] = f
 		}
 		return func(r *rt, s *scope) (any, error) {
+			// Workers share s: capture it here so they never mark it.
+			if err := r.captureScope(s); err != nil {
+				return nil, err
+			}
 			return r.runBatch(len(items), settled, isolated, func(w *rt, i int) (any, error) { return items[i](w, s) })
 		}, nil
 	}
@@ -518,7 +522,7 @@ func (c *compiler) batch(kind string, n *ast.CallExpression) (evalFn, error) {
 					if err != nil {
 						return nil, err
 					}
-					f := fv.(*function)
+					f := fv.(*function) // a closure over s: s is captured
 					items := append([]any(nil), denseItems(a.items)...)
 					return r.runBatch(len(items), settled, isolated, func(w *rt, i int) (any, error) {
 						return w.call(f, []any{items[i], float64(i), a})
@@ -546,6 +550,13 @@ func (r *rt) settle(v any, settled bool) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	n := allocHeader + len(items)*allocSlot
+	if settled {
+		n += len(items) * (allocHeader + 2*allocProp)
+	}
+	if err := r.charge(n); err != nil {
+		return nil, err
+	}
 	out := make([]any, len(items))
 	for i, item := range items {
 		if settled {
@@ -562,6 +573,13 @@ func (r *rt) settle(v any, settled bool) (any, error) {
 func (r *rt) runBatch(size int, settled, isolated bool, eval func(w *rt, i int) (any, error)) (any, error) {
 	if size > r.x.opts.MaxItems {
 		return nil, errors.New("batch item limit exceeded")
+	}
+	n := allocHeader + size*allocSlot
+	if settled {
+		n += size * (allocHeader + 2*allocProp)
+	}
+	if err := r.charge(n); err != nil {
+		return nil, err
 	}
 	out := make([]any, size)
 	errs := make([]error, size)
@@ -626,6 +644,7 @@ func (r *rt) runBatch(size int, settled, isolated bool, eval func(w *rt, i int) 
 				i := int(next.Add(1) - 1)
 				if i >= size {
 					r.x.steps.Add(int64(w.pending))
+					r.x.alloc.Add(int64(w.allocPending))
 					return
 				}
 				w.item, w.logs = i, nil

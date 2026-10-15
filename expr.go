@@ -171,7 +171,7 @@ func (c *compiler) expression(node ast.Expression) (evalFn, error) {
 		if err != nil {
 			return nil, err
 		}
-		return func(_ *rt, s *scope) (any, error) { return &function{code: code, scope: s}, nil }, nil
+		return closureFn(code), nil
 	case *ast.FunctionLiteral:
 		return c.functionExpression(n)
 	case *ast.AwaitExpression:
@@ -187,7 +187,12 @@ func (c *compiler) expression(node ast.Expression) (evalFn, error) {
 			return nil, unsupported(n)
 		}
 		// Each evaluation of a literal creates a fresh RegExp object.
-		return func(*rt, *scope) (any, error) { return &regexpValue{pat: p, lastIndex: float64(0)}, nil }, nil
+		return func(r *rt, _ *scope) (any, error) {
+			if err := r.charge(allocHeader); err != nil {
+				return nil, err
+			}
+			return &regexpValue{pat: p, lastIndex: float64(0)}, nil
+		}, nil
 	}
 	return nil, unsupported(node)
 }
@@ -201,7 +206,7 @@ func (c *compiler) functionExpression(n *ast.FunctionLiteral) (evalFn, error) {
 		if err != nil {
 			return nil, err
 		}
-		return func(_ *rt, s *scope) (any, error) { return &function{code: code, scope: s}, nil }, nil
+		return closureFn(code), nil
 	}
 	// A named function expression sees its own name in an enclosing scope.
 	name := n.Name.Name.String()
@@ -218,12 +223,27 @@ func (c *compiler) functionExpression(n *ast.FunctionLiteral) (evalFn, error) {
 	}
 	slot := v.slot
 	init := sc.init
-	return func(_ *rt, s *scope) (any, error) {
+	return func(r *rt, s *scope) (any, error) {
 		inner := newScope(s, init)
-		f := &function{code: code, scope: inner, name: name}
+		f, err := r.closure(code, inner, name)
+		if err != nil {
+			return nil, err
+		}
 		inner.vars[slot] = f
 		return f, nil
 	}, nil
+}
+
+// closureFn evaluates a function literal to a new closure over the current
+// scope.
+func closureFn(code *funcCode) evalFn {
+	return func(r *rt, s *scope) (any, error) {
+		f, err := r.closure(code, s, "")
+		if err != nil {
+			return nil, err
+		}
+		return f, nil
+	}
 }
 
 func (c *compiler) template(n *ast.TemplateLiteral) (evalFn, error) {
@@ -264,7 +284,7 @@ func (c *compiler) template(n *ast.TemplateLiteral) (evalFn, error) {
 				}
 			}
 		}
-		return b.String(), nil
+		return r.stringValue(b.String())
 	}, nil
 }
 
@@ -380,6 +400,9 @@ func (c *compiler) arrayLiteral(n *ast.ArrayLiteral) (evalFn, error) {
 		elems[i] = e
 	}
 	return func(r *rt, s *scope) (any, error) {
+		if err := r.chargeArray(len(elems)); err != nil {
+			return nil, err
+		}
 		out := make([]any, 0, len(elems))
 		for _, e := range elems {
 			v, err := e.f(r, s)
@@ -391,10 +414,13 @@ func (c *compiler) arrayLiteral(n *ast.ArrayLiteral) (evalFn, error) {
 				if err != nil {
 					return nil, err
 				}
-				out = append(out, items...)
-				if len(out) > r.x.maxItems {
+				if len(out)+len(items) > r.x.maxItems {
 					return nil, r.rangeError("Invalid array length")
 				}
+				if err := r.charge(len(items) * allocSlot); err != nil {
+					return nil, err
+				}
+				out = append(out, items...)
 				continue
 			}
 			out = append(out, v)
@@ -472,7 +498,10 @@ func (c *compiler) objectLiteral(n *ast.ObjectLiteral) (evalFn, error) {
 		}
 	}
 	return func(r *rt, s *scope) (any, error) {
-		o := newObject(len(props))
+		o, err := r.newObj(len(props))
+		if err != nil {
+			return nil, err
+		}
 		for _, p := range props {
 			name := p.name
 			if p.key != nil {
@@ -511,29 +540,38 @@ func isFunctionLiteral(e ast.Expression) bool {
 	return false
 }
 
-// copyProps implements object spread / Object.assign sources.
+// copyProps implements object spread sources, charging for each property
+// it adds to dst.
 func (r *rt) copyProps(dst *object, src any) error {
 	switch t := src.(type) {
 	case *object:
 		for _, k := range t.ownKeys() {
 			v, _ := t.own(k)
-			dst.set(k, v)
+			if err := r.put(dst, k, v); err != nil {
+				return err
+			}
 		}
 	case *hostObject:
 		for _, k := range t.view.ownKeys() {
 			v, _ := t.view.own(k)
-			dst.set(k, v)
+			if err := r.put(dst, k, v); err != nil {
+				return err
+			}
 		}
 	case *array:
 		for i, v := range t.items {
 			if !isHole(v) {
-				dst.set(strconv.Itoa(i), v)
+				if err := r.put(dst, strconv.Itoa(i), v); err != nil {
+					return err
+				}
 			}
 		}
 		if t.props != nil {
 			for _, k := range t.props.ownKeys() {
 				v, _ := t.props.own(k)
-				dst.set(k, v)
+				if err := r.put(dst, k, v); err != nil {
+					return err
+				}
 			}
 		}
 	case *dateValue, *collection, *regexpValue, *function:
@@ -552,13 +590,21 @@ func (r *rt) copyProps(dst *object, src any) error {
 		if props != nil {
 			for _, k := range props.ownKeys() {
 				v, _ := props.own(k)
-				dst.set(k, v)
+				if err := r.put(dst, k, v); err != nil {
+					return err
+				}
 			}
 		}
 	case string:
 		i := 0
 		for _, u := range toUnits(t) {
-			dst.set(strconv.Itoa(i), fromUnits([]uint16{u}))
+			ch := fromUnits([]uint16{u})
+			if err := r.chargeString(ch); err != nil {
+				return err
+			}
+			if err := r.put(dst, strconv.Itoa(i), ch); err != nil {
+				return err
+			}
 			i++
 		}
 	}
@@ -713,6 +759,9 @@ func (c *compiler) newExpression(n *ast.NewExpression) (evalFn, error) {
 }
 
 func (r *rt) makeError(name string, args []any) (any, error) {
+	if err := r.charge(allocHeader); err != nil {
+		return nil, err
+	}
 	e := newError(name, "")
 	// Goja keeps a non-string message as given (the spec would ToString it).
 	e.errMsg = Undefined
@@ -1342,6 +1391,12 @@ func (r *rt) add(a, b any) (any, error) {
 func (r *rt) concat(a, b string) (any, error) {
 	if len(a)+len(b) > r.x.maxString {
 		return nil, r.rangeError("Invalid string length")
+	}
+	if a == "" || b == "" {
+		return a + b, nil // the non-empty operand itself: nothing new
+	}
+	if err := r.charge(len(a) + len(b) + allocSlot); err != nil {
+		return nil, err
 	}
 	return a + b, nil
 }

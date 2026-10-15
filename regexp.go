@@ -343,6 +343,21 @@ func (p *compiledRegexp) matchArray(s *subject, m []int) *array {
 	return a
 }
 
+// matchValue builds an exec/match result and charges for it: the array and
+// its captures, and its index/input/groups properties (input is the subject
+// string itself, which the result shares).
+func (r *rt) matchValue(p *compiledRegexp, s *subject, m []int) (any, error) {
+	a := p.matchArray(s, m)
+	n := freshSize(a, 1) + allocHeader + 3*allocProp
+	if g, ok := a.props.own("groups"); ok {
+		n += freshSize(g, 1)
+	}
+	if err := r.charge(n); err != nil {
+		return nil, err
+	}
+	return a, nil
+}
+
 func (p *compiledRegexp) groupsObject(captures []any) any {
 	var groups *object
 	for i, name := range p.groupNames() {
@@ -377,9 +392,9 @@ func (r *rt) regexpMethod(rx *regexpValue, key string, args []any) (any, error) 
 		if m == nil {
 			return nil, nil
 		}
-		return rx.pat.matchArray(s, m), nil
+		return r.matchValue(rx.pat, s, m)
 	case "toString":
-		return "/" + rx.pat.source + "/" + rx.pat.flags, nil
+		return r.stringValue("/" + rx.pat.source + "/" + rx.pat.flags)
 	}
 	return nil, r.typeError("Object has no member '" + key + "'")
 }
@@ -417,7 +432,7 @@ func (r *rt) stringMatch(s string, rx *regexpValue) (any, error) {
 		if err != nil || m == nil {
 			return nil, err
 		}
-		return rx.pat.matchArray(sub, m), nil
+		return r.matchValue(rx.pat, sub, m)
 	}
 	rx.resetLastIndex()
 	sub := newSubject(s)
@@ -425,11 +440,15 @@ func (r *rt) stringMatch(s string, rx *regexpValue) (any, error) {
 	if len(all) == 0 {
 		return nil, nil
 	}
+	if len(all) > r.x.maxItems {
+		return nil, r.rangeError("Invalid array length")
+	}
 	out := make([]any, len(all))
 	for i, m := range all {
 		out[i] = sub.slice(m[0], m[1])
 	}
-	return &array{items: out}, nil
+	a := &array{items: out}
+	return a, r.chargeFresh(a)
 }
 
 func (r *rt) stringSearch(s string, rx *regexpValue) (any, error) {
@@ -528,7 +547,7 @@ func (r *rt) stringReplaceRegexp(s string, rx *regexpValue, repl any, all bool) 
 	if last < sub.length() {
 		b.WriteString(sub.slice(last, sub.length()))
 	}
-	return b.String(), nil
+	return r.stringValue(b.String())
 }
 
 // writeSubstitution ports Goja's GetSubstitution for regular expressions.
@@ -693,6 +712,11 @@ func (r *rt) newRegExp(args []any) (any, error) {
 	}
 	if pattern == "" {
 		pattern = "(?:)"
+	}
+	// Compiling builds a program about one instruction per pattern byte,
+	// which the RegExp keeps.
+	if err := r.charge(allocHeader + allocRegexpUnit*len(pattern)); err != nil {
+		return nil, err
 	}
 	p, ok, bad := compileRegexp(pattern, flags)
 	if bad != "" {

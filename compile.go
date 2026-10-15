@@ -108,6 +108,9 @@ const (
 type scope struct {
 	parent *scope
 	vars   []any
+	// charged is set once a closure has captured this scope and it has been
+	// charged against the allocation budget (see captureScope).
+	charged bool
 }
 
 func (s *scope) up(hops int) *scope {
@@ -1246,6 +1249,9 @@ func (r *rt) iterate(v any, step func(any) (ctl, any, error)) (ctl, any, error) 
 			if !more {
 				return ctlNormal, nil, nil
 			}
+			if err := r.charge(it.cost); err != nil {
+				return 0, nil, err
+			}
 			k, rv, err := step(item)
 			if err != nil {
 				return 0, nil, err
@@ -1391,6 +1397,11 @@ func (c *compiler) tryStatement(n *ast.TryStatement) (stmtFn, error) {
 		if err != nil && errors.As(err, &thrown) && catchBody != nil && !r.x.aborted.Load() {
 			cs := s
 			if catchScope != nil {
+				// The caught value is reachable now: charge for it, but run
+				// the handler even past the budget so that the budget's own
+				// RangeError stays catchable. Past it, any allocation the
+				// handler makes to keep the value throws.
+				_ = r.charge(allocHeader)
 				cs = newScope(s, catchScope.init)
 				if err := catchBind(r, cs, thrown.Value); err != nil {
 					return r.finish(finally, s, 0, nil, err)

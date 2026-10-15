@@ -59,6 +59,15 @@ type ExecuteOptions struct {
 	MaxArrayLength int
 	MaxStringBytes int
 	MaxCallDepth   int // default 1000 nested function calls
+	// MaxAllocBytes bounds the memory one execution may allocate for values
+	// the script can reach (strings, arrays, objects, closures, Map/Set
+	// entries, JSON.parse output, converted tool and host results; see
+	// alloc.go). Charges are never credited back when a value becomes
+	// garbage, so the total bounds what the run can hold live at once.
+	// Exceeding it throws a catchable RangeError ("allocation budget
+	// exceeded"), and every later allocation in the run throws as well.
+	// Zero (the default) means unlimited.
+	MaxAllocBytes int64
 	// Now is the clock for Date (default time.Now); Location is the local
 	// time zone for Date (default time.Local), both as in Goja.
 	Now      func() time.Time
@@ -74,6 +83,8 @@ type Result struct {
 	Calls     int
 	HostCalls int
 	Steps     int // statements, calls and loop iterations executed
+	// Allocated is the bytes charged against MaxAllocBytes (0 when unlimited).
+	Allocated int64
 	Aborted   bool
 }
 
@@ -92,6 +103,10 @@ type execution struct {
 	maxDepth   int
 	batch      int // steps per publication; 1 for tiny budgets
 	aborted    atomic.Bool
+	alloc      atomic.Int64 // bytes charged against maxAlloc
+	allocSpent atomic.Bool  // alloc passed maxAlloc: every charge throws
+	maxAlloc   int64        // 0 = unlimited
+	allocBatch int          // bytes charged per publication (see charge)
 }
 
 // rt is the per-goroutine interpreter state for one execution.
@@ -102,6 +117,8 @@ type rt struct {
 	nesting int             // conversion levels active on this stack (see enterNesting)
 	depth   int
 	pending int // steps not yet published to x.steps
+	// allocPending is bytes charged but not yet published to x.alloc.
+	allocPending int
 	frames  []*scope8
 	coll    *collate.Collator
 	label   string        // target of a labeled break/continue in flight
@@ -211,6 +228,12 @@ func (p *Program) Execute(ctx context.Context, opts ExecuteOptions) (res Result,
 	if opts.MaxSteps < 64*1024 {
 		x.batch = 1
 	}
+	if opts.MaxAllocBytes > 0 {
+		// Publishing every 1/64th of the budget (at most 64 KiB) bounds how
+		// far parallel workers can overrun it before one of them notices.
+		x.maxAlloc = opts.MaxAllocBytes
+		x.allocBatch = int(min(allocBatchMax, opts.MaxAllocBytes/64))
+	}
 	r := &rt{ctx: ctx, x: x}
 	x.sequential = p.sequential
 	if p.namespace != nil {
@@ -221,13 +244,14 @@ func (p *Program) Execute(ctx context.Context, opts ExecuteOptions) (res Result,
 	defer func() {
 		if p := recover(); p != nil {
 			err = fmt.Errorf("toolscript: internal error: %v", p)
-			res = Result{Value: Undefined, Calls: int(x.calls.Load()), HostCalls: int(x.hostCalls.Load()), Steps: int(x.steps.Load()), Aborted: x.aborted.Load()}
+			res = Result{Value: Undefined, Calls: int(x.calls.Load()), HostCalls: int(x.hostCalls.Load()), Steps: int(x.steps.Load()), Allocated: x.alloc.Load(), Aborted: x.aborted.Load()}
 		}
 	}()
 	var v any = Undefined
 	if err = ctx.Err(); err == nil {
 		v, err = r.invoke(&function{code: p.main}, nil)
 		x.steps.Add(int64(r.pending))
+		x.alloc.Add(int64(r.allocPending))
 	}
 	if err == nil {
 		v, err = exportValue(v, r.location())
@@ -248,7 +272,7 @@ func (p *Program) Execute(ctx context.Context, opts ExecuteOptions) (res Result,
 	if err != nil {
 		v = Undefined
 	}
-	return Result{Value: v, Calls: int(x.calls.Load()), HostCalls: int(x.hostCalls.Load()), Steps: int(x.steps.Load()), Aborted: x.aborted.Load()}, err
+	return Result{Value: v, Calls: int(x.calls.Load()), HostCalls: int(x.hostCalls.Load()), Steps: int(x.steps.Load()), Allocated: x.alloc.Load(), Aborted: x.aborted.Load()}, err
 }
 
 // tick charges one step. Steps are accounted locally and published in small
@@ -344,6 +368,7 @@ func (r *rt) invokeDirect(f *function, argFns []evalFn, caller *scope) (any, err
 		// A leaf frame is unreachable after return: nothing captured it.
 		pooled.buf = [8]any{}
 		pooled.parent = nil
+		pooled.charged = false
 		r.frames = append(r.frames, pooled)
 	}
 	return v, err
@@ -376,6 +401,9 @@ func (r *rt) invokeBody(f *function, args []any) (any, error) {
 	if code.rest != nil {
 		var tail []any
 		if len(args) > len(code.params) {
+			if err := r.chargeArray(len(args) - len(code.params)); err != nil {
+				return nil, err
+			}
 			tail = append(tail, args[len(code.params):]...)
 		}
 		if err := code.rest(r, s, &array{items: nonNil(tail)}); err != nil {
@@ -395,7 +423,11 @@ func (r *rt) invokeBody(f *function, args []any) (any, error) {
 func (r *rt) runBody(f *function, s *scope) (any, error) {
 	code := f.code
 	for _, h := range code.hoisted {
-		s.vars[h.slot] = &function{code: h.code, scope: s, name: h.name}
+		fn, err := r.closure(h.code, s, h.name)
+		if err != nil {
+			return nil, err
+		}
+		s.vars[h.slot] = fn
 	}
 	if code.exprBody != nil {
 		return code.exprBody(r, s)
@@ -469,7 +501,7 @@ func (r *rt) callTool(name string, arg any) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	return fromGo(v)
+	return r.fromGo(v)
 }
 
 func (r *rt) callHost(name string, args []any) (any, error) {
@@ -495,7 +527,7 @@ func (r *rt) callHost(name string, args []any) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	return fromGo(v)
+	return r.fromGo(v)
 }
 
 // effect charges and performs one tool/host call. Ordinary failures (and
@@ -555,15 +587,23 @@ func (r *rt) effect(counter *atomic.Int64, limit int, label string, dispatch fun
 
 // fromGo converts host (Dispatch) data into runtime values. Object keys from
 // Go maps have no order, so they enumerate sorted (Goja's order is random).
-func fromGo(v any) (any, error) { return fromGoDepth(v, 0) }
+// The converted value is the script's, so it is charged against the
+// allocation budget as it is built: a tool returning a large result costs
+// what holding that result costs.
+func (r *rt) fromGo(v any) (any, error) { return r.fromGoDepth(v, 0) }
 
 // fromGoDepth bounds the nesting it descends: a tool or host dispatcher that
 // returns data nested past maxConversionNesting would otherwise recurse once
 // per level until the goroutine stack overflows fatally, which recover()
 // cannot catch. It fails the conversion instead.
-func fromGoDepth(v any, depth int) (any, error) {
+func (r *rt) fromGoDepth(v any, depth int) (any, error) {
 	switch v := v.(type) {
-	case nil, bool, float64, string, undefined:
+	case string:
+		if err := r.chargeString(v); err != nil {
+			return nil, err
+		}
+		return v, nil
+	case nil, bool, float64, undefined:
 		return v, nil
 	case int:
 		return float64(v), nil
@@ -583,13 +623,18 @@ func fromGoDepth(v any, depth int) (any, error) {
 			return nil, errStackOverflow
 		}
 		keys := make([]string, 0, len(v))
+		n := allocHeader
 		for k := range v {
 			keys = append(keys, k)
+			n += allocProp + len(k)
+		}
+		if err := r.charge(n); err != nil {
+			return nil, err
 		}
 		sort.Strings(keys)
 		o := newObject(len(v))
 		for _, k := range keys {
-			c, err := fromGoDepth(v[k], depth+1)
+			c, err := r.fromGoDepth(v[k], depth+1)
 			if err != nil {
 				return nil, err
 			}
@@ -600,9 +645,12 @@ func fromGoDepth(v any, depth int) (any, error) {
 		if depth >= maxConversionNesting {
 			return nil, errStackOverflow
 		}
+		if err := r.chargeArray(len(v)); err != nil {
+			return nil, err
+		}
 		items := make([]any, len(v))
 		for i, e := range v {
-			c, err := fromGoDepth(e, depth+1)
+			c, err := r.fromGoDepth(e, depth+1)
 			if err != nil {
 				return nil, err
 			}
@@ -612,6 +660,15 @@ func fromGoDepth(v any, depth int) (any, error) {
 	case *Object:
 		if depth >= maxConversionNesting {
 			return nil, errStackOverflow
+		}
+		// Export is the host's own immutable copy of Fields, made before
+		// the run sees it; the view built from Fields is charged.
+		n := 2 * allocHeader
+		for k := range v.Fields {
+			n += allocProp + len(k)
+		}
+		if err := r.charge(n); err != nil {
+			return nil, err
 		}
 		view := newObject(len(v.Fields))
 		keys := v.Order
@@ -626,7 +683,7 @@ func fromGoDepth(v any, depth int) (any, error) {
 			if !ok {
 				continue
 			}
-			c, err := fromGoDepth(f, depth+1)
+			c, err := r.fromGoDepth(f, depth+1)
 			if err != nil {
 				return nil, err
 			}

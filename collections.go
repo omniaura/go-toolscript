@@ -45,6 +45,11 @@ func (c *collection) set(r *rt, k, v any) error {
 	if len(c.keys) >= r.x.maxItems {
 		return r.rangeError("Invalid collection size")
 	}
+	// Deleted entries stay as tombstones, so every new key grows the
+	// collection for good.
+	if err := r.charge(allocEntry); err != nil {
+		return err
+	}
 	if f, ok := k.(float64); ok && f == 0 {
 		k = 0.0 // stored keys are normalized: new Set([-0]) holds +0
 	}
@@ -106,6 +111,20 @@ func (c *collection) entry(i int, kind string) any {
 type iterator struct {
 	next func() (any, bool)
 	name string // "Array", "Set" or "Map", for String(it)
+	// cost is the bytes each next() allocates for the value it yields (the
+	// [key, value] array of an entries iterator); consumers charge it.
+	cost int
+}
+
+// entryCost is what an entries iterator allocates per item.
+const entryCost = allocHeader + 2*allocSlot
+
+// iteratorValue charges for a new iterator and returns it.
+func (r *rt) iteratorValue(it *iterator) (any, error) {
+	if err := r.charge(allocHeader); err != nil {
+		return nil, err
+	}
+	return it, nil
 }
 
 func (c *collection) iterator(kind string) *iterator {
@@ -114,7 +133,11 @@ func (c *collection) iterator(kind string) *iterator {
 	if c.isMap {
 		name = "Map"
 	}
-	return &iterator{name: name, next: func() (any, bool) {
+	cost := 0
+	if kind == "entries" {
+		cost = entryCost
+	}
+	return &iterator{name: name, cost: cost, next: func() (any, bool) {
 		for i < len(c.keys) {
 			j := i
 			i++
@@ -128,7 +151,11 @@ func (c *collection) iterator(kind string) *iterator {
 
 func arrayIterator(a *array, kind string) *iterator {
 	i := 0
-	return &iterator{name: "Array", next: func() (any, bool) {
+	cost := 0
+	if kind == "entries" {
+		cost = entryCost
+	}
+	return &iterator{name: "Array", cost: cost, next: func() (any, bool) {
 		if i >= len(a.items) {
 			return nil, false
 		}
@@ -166,6 +193,9 @@ func (it *iterator) drain(r *rt) ([]any, error) {
 		if !ok {
 			return out, nil
 		}
+		if err := r.charge(allocSlot + it.cost); err != nil {
+			return nil, err
+		}
 		out = append(out, v)
 		if len(out) > r.x.maxItems {
 			return nil, r.rangeError("Invalid array length")
@@ -175,6 +205,9 @@ func (it *iterator) drain(r *rt) ([]any, error) {
 
 // newCollectionFrom implements new Set(iterable) / new Map(entries).
 func (r *rt) newCollectionFrom(isMap bool, args []any) (any, error) {
+	if err := r.charge(allocHeader); err != nil {
+		return nil, err
+	}
 	c := newCollection(isMap)
 	src := arg(args, 0)
 	if isNullish(src) {
@@ -221,7 +254,7 @@ func (r *rt) collectionMethod(c *collection, key string, args []any) (any, error
 		c.clear()
 		return Undefined, nil
 	case "keys", "values", "entries":
-		return c.iterator(key), nil
+		return r.iteratorValue(c.iterator(key))
 	case "forEach":
 		f := arg(args, 0)
 		if err := r.requireCallable(f); err != nil {
@@ -260,6 +293,9 @@ func (r *rt) collectionMethod(c *collection, key string, args []any) (any, error
 func (r *rt) iteratorMethod(it *iterator, key string) (any, error) {
 	switch key {
 	case "next":
+		if err := r.charge(allocHeader + 2*allocProp + it.cost); err != nil {
+			return nil, err
+		}
 		o := newObject(2)
 		v, ok := it.next()
 		if !ok {
@@ -301,6 +337,9 @@ func (r *rt) newArrayFromArgs(args []any) (any, error) {
 			if int(f) > maxHoles {
 				return nil, errRuntimeUnsupported("large sparse Array(n)")
 			}
+			if err := r.chargeArray(int(f)); err != nil {
+				return nil, err
+			}
 			items := make([]any, int(f))
 			for i := range items {
 				items[i] = hole
@@ -308,7 +347,7 @@ func (r *rt) newArrayFromArgs(args []any) (any, error) {
 			return &array{items: items}, nil
 		}
 	}
-	return &array{items: append([]any{}, args...)}, nil
+	return r.arrayValue(append([]any{}, args...))
 }
 
 func (r *rt) functionMethod(f *function, key string, args []any) (any, bool, error) {
@@ -335,6 +374,9 @@ func (r *rt) functionMethod(f *function, key string, args []any) (any, bool, err
 	case "bind":
 		if f.binds >= maxBindNesting {
 			return nil, true, r.rangeError("Maximum call stack size exceeded")
+		}
+		if err := r.charge(2*allocHeader + len(args)*allocSlot); err != nil {
+			return nil, true, err
 		}
 		var bound []any
 		if len(args) > 1 {

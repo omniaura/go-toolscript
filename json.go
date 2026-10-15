@@ -72,7 +72,7 @@ func (r *rt) stringify(v, replacer, space any) (any, error) {
 	if !ok {
 		return Undefined, nil
 	}
-	return ctx.buf.String(), nil
+	return r.stringValue(ctx.buf.String())
 }
 
 func (ctx *stringifier) str(key string, holder any) (bool, error) {
@@ -328,7 +328,10 @@ func (r *rt) decodeToken(d *json.Decoder, tok json.Token, depth int) (any, error
 		}
 		switch t {
 		case '{':
-			o := newObject(4)
+			o, err := r.newObj(0)
+			if err != nil {
+				return nil, err
+			}
 			for {
 				key, err := d.Token()
 				if err != nil {
@@ -345,9 +348,14 @@ func (r *rt) decodeToken(d *json.Decoder, tok json.Token, depth int) (any, error
 				if err != nil {
 					return nil, err
 				}
-				o.set(k, v)
+				if err := r.put(o, k, v); err != nil {
+					return nil, err
+				}
 			}
 		case '[':
+			if err := r.chargeArray(0); err != nil {
+				return nil, err
+			}
 			items := []any{}
 			for {
 				tok, err := d.Token()
@@ -361,13 +369,18 @@ func (r *rt) decodeToken(d *json.Decoder, tok json.Token, depth int) (any, error
 				if err != nil {
 					return nil, err
 				}
+				if err := r.charge(allocSlot); err != nil {
+					return nil, err
+				}
 				items = append(items, v)
 				if len(items) > r.x.maxItems {
 					return nil, r.rangeError("Invalid array length")
 				}
 			}
 		}
-	case nil, bool, float64, string:
+	case string:
+		return r.stringValue(t)
+	case nil, bool, float64:
 		return t, nil
 	}
 	return nil, errors.New("Unexpected token")

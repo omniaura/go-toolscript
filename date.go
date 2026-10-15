@@ -506,11 +506,22 @@ func init() {
 		dateMethods["get"+name] = dateGetter(get, false)
 		dateMethods["getUTC"+name] = dateGetter(get, true)
 	}
+	// Every Date method that returns a string (toISOString, toString,
+	// toLocaleString, ...) renders it afresh: charge for it.
+	for name, m := range dateMethods {
+		dateMethods[name] = func(r *rt, d *dateValue, args []any) (any, error) {
+			v, err := m(r, d, args)
+			if err != nil {
+				return nil, err
+			}
+			return v, r.chargeFresh(v)
+		}
+	}
 }
 
 // Date statics: Date(), Date.now(), Date.parse(), Date.UTC().
 func (r *rt) dateCall() (any, error) {
-	return r.now().In(r.location()).Format(dateTimeLayout), nil
+	return r.stringValue(r.now().In(r.location()).Format(dateTimeLayout))
 }
 
 // registerDateStatics is called by the built-ins initializer, after
@@ -544,6 +555,9 @@ func registerDateStatics() {
 func (r *rt) newDateFromArgs(args []any) (any, error) {
 	t, valid, err := r.makeDate(args, false)
 	if err != nil {
+		return nil, err
+	}
+	if err := r.charge(allocHeader); err != nil {
 		return nil, err
 	}
 	return newDate(t, valid), nil

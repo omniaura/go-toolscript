@@ -49,11 +49,28 @@ func (r *rt) newIntl(name string, args []any) (any, error) {
 	if k == nil {
 		return nil, errRuntimeUnsupported("Intl." + name)
 	}
+	// The resolved state holds a handful of option strings and tables.
+	if err := r.charge(allocIntl); err != nil {
+		return nil, err
+	}
 	state, err := k.construct(r, arg(args, 0), arg(args, 1))
 	if err != nil {
 		return nil, err
 	}
 	return &intlObject{kind: k, state: state}, nil
+}
+
+// allocIntl approximates an Intl instance with its resolved state.
+const allocIntl = 8 * allocHeader
+
+// callIntl calls an Intl method, charging for the strings, parts arrays or
+// option objects it returns (each is built afresh).
+func (r *rt) callIntl(m intlMethod, o *intlObject, args []any) (any, error) {
+	v, err := m.call(r, o, args)
+	if err != nil {
+		return nil, err
+	}
+	return v, r.chargeFresh(v)
 }
 
 // intlMember reads a property of an Intl instance.
@@ -67,7 +84,7 @@ func (r *rt) intlMember(o *intlObject, key string) (any, bool) {
 		if o.bound == nil {
 			m := o.kind.methods[key]
 			o.bound = &function{length: m.length, native: func(r *rt, _ any, args []any) (any, error) {
-				return m.call(r, o, args)
+				return r.callIntl(m, o, args)
 			}}
 		}
 		return o.bound, true
@@ -85,7 +102,7 @@ func (r *rt) intlMethodCall(o *intlObject, key string, args []any) (any, error) 
 		}
 	}
 	if m, ok := o.kind.methods[key]; ok {
-		return m.call(r, o, args)
+		return r.callIntl(m, o, args)
 	}
 	return r.objectMethod(o, key, args)
 }
@@ -112,7 +129,7 @@ func intlProtoFn(k *intlKind, key string) *function {
 		if !ok || o.kind != k {
 			return nil, r.typeError("Method Intl." + k.name + ".prototype." + key + " called on incompatible receiver " + receiverText(r, this))
 		}
-		return m.call(r, o, args)
+		return r.callIntl(m, o, args)
 	}}
 	intlProtoFns[id] = f
 	return f
@@ -137,7 +154,7 @@ func init() {
 		if err != nil {
 			return nil, err
 		}
-		return stringArray(tags), nil
+		return r.stringsValue(tags)
 	}
 	staticFunctions["Intl.supportedValuesOf"] = func(r *rt, args []any) (any, error) {
 		key, err := r.toString(arg(args, 0))
@@ -148,7 +165,7 @@ func init() {
 		if !ok {
 			return nil, r.rangeError("Invalid key : " + key)
 		}
-		return stringArray(values), nil
+		return r.stringsValue(values)
 	}
 }
 
@@ -172,7 +189,11 @@ func intlStatic(full string) (func(r *rt, args []any) (any, error), bool) {
 		}, true
 	case len(parts) == 3 && parts[2] == "supportedLocalesOf":
 		return func(r *rt, args []any) (any, error) {
-			return r.supportedLocalesOf(k.name, arg(args, 0), arg(args, 1))
+			v, err := r.supportedLocalesOf(k.name, arg(args, 0), arg(args, 1))
+			if err != nil {
+				return nil, err
+			}
+			return v, r.chargeFresh(v)
 		}, true
 	}
 	return nil, false
