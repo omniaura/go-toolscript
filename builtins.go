@@ -450,7 +450,7 @@ func init() {
 			} else if cycle {
 				return "", nil
 			}
-			defer delete(r.joining, a)
+			defer r.leaveJoin(a)
 			parts := make([]any, len(a.items))
 			for i, v := range a.items {
 				if isNullish(v) {

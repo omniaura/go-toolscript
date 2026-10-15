@@ -320,7 +320,7 @@ func (r *rt) toPrimitiveHint(v any, hint string) (any, error) {
 				fv, own := t.own(m)
 				if !own {
 					if m == "toString" {
-						return r.defaultObjectString(t), nil
+						return r.defaultObjectString(t)
 					}
 					continue // Object.prototype.valueOf returns the object
 				}
@@ -338,7 +338,7 @@ func (r *rt) toPrimitiveHint(v any, hint string) (any, error) {
 			}
 			return nil, r.typeError("Cannot convert object to primitive value")
 		}
-		return r.defaultObjectString(t), nil
+		return r.defaultObjectString(t)
 	case *dateValue:
 		// Date's @@toPrimitive: "number" gives the time value, else a string.
 		if hint == "number" {
@@ -363,11 +363,11 @@ func userConversion(o *object) bool {
 	return s || v
 }
 
-func (r *rt) defaultObjectString(o *object) string {
+func (r *rt) defaultObjectString(o *object) (string, error) {
 	if o.errName != "" {
-		return errorToString(o)
+		return r.errorString(o)
 	}
-	return "[object Object]"
+	return "[object Object]", nil
 }
 
 func (r *rt) toString(v any) (string, error) {
@@ -395,7 +395,7 @@ func (r *rt) toString(v any) (string, error) {
 			}
 			return r.toString(p)
 		}
-		return r.defaultObjectString(v), nil
+		return r.defaultObjectString(v)
 	case *hostObject:
 		return "[object Object]", nil
 	case *regexpValue:
@@ -420,44 +420,37 @@ func (r *rt) toString(v any) (string, error) {
 	return "", errInternal
 }
 
-// errorToString implements Error.prototype.toString for our error objects.
-func errorToString(o *object) string {
-	r := &rt{x: &execution{maxString: 1 << 20}}
-	name, _ := o.get("name")
-	msg, _ := o.get("message")
-	ns, ms := "Error", ""
-	if !isUndefined(name) {
-		ns, _ = r.toString(name)
+// maxConversionNesting bounds how deeply the value-conversion builtins
+// (join/toString, toLocaleString, Error.prototype.toString, flat), JSON.parse
+// (decodeToken) and the host-data converter (fromGo) descend through nested
+// values. Each level is a Go stack frame, and a script can nest containers
+// millions deep within its step budget; past the goroutine stack limit that is
+// a fatal runtime error the host process cannot recover(), not a catchable
+// panic. Engines instead throw a RangeError. JSON.stringify
+// (stringifier.str) and Marshal (jsonValue) enforce the same 10000 levels.
+const maxConversionNesting = 10000
+
+// enterNesting takes one level of the conversion budget that join,
+// toLocaleString and errorString share: r.nesting counts the conversion levels
+// active on this goroutine's stack, so nesting that alternates between arrays
+// and Errors (or runs through a script toString in between) is bounded as one
+// recursion. Past maxConversionNesting it throws a RangeError. On success the
+// caller must call leaveNesting when that level returns.
+func (r *rt) enterNesting() error {
+	if r.nesting >= maxConversionNesting {
+		return r.rangeError("Maximum call stack size exceeded")
 	}
-	if !isUndefined(msg) {
-		ms, _ = r.toString(msg)
-	}
-	if ns == "" {
-		return ms
-	}
-	if ms == "" {
-		return ns
-	}
-	return ns + ": " + ms
+	r.nesting++
+	return nil
 }
 
-// maxConversionNesting bounds how deeply the value-conversion builtins
-// (join/toString, toLocaleString, flat) and the host-data converter (fromGo)
-// descend through nested arrays and objects. Each level is a Go stack frame,
-// and a script can nest containers millions deep within its step budget; past
-// the goroutine stack limit that is a fatal runtime error the host process
-// cannot recover(), not a catchable panic. Engines instead throw a RangeError,
-// and this matches the 10000-level limit JSON.stringify (stringifier.str),
-// Marshal (jsonValue) and encoding/json's own JSON.parse decoder enforce.
-const maxConversionNesting = 10000
+func (r *rt) leaveNesting() { r.nesting-- }
 
 // enterJoin marks array a as being converted and reports a cycle (which
 // engines render as the empty string) or throws past maxConversionNesting.
-// join and toLocaleString share r.joining, so mixed nesting shares one bound;
-// len(r.joining) is the current conversion depth because every active frame
-// has exactly one entry on the map that its deferred delete removes on return.
-// On success (cycle == false, err == nil) the caller must delete a from
-// r.joining when it is done.
+// join and toLocaleString share r.joining and the r.nesting budget. On success
+// (cycle == false, err == nil) the caller must call leaveJoin(a) when it is
+// done.
 func (r *rt) enterJoin(a *array) (cycle bool, err error) {
 	if r.joining == nil {
 		r.joining = map[*array]bool{}
@@ -465,11 +458,16 @@ func (r *rt) enterJoin(a *array) (cycle bool, err error) {
 	if r.joining[a] {
 		return true, nil
 	}
-	if len(r.joining) >= maxConversionNesting {
-		return false, r.rangeError("Maximum call stack size exceeded")
+	if err := r.enterNesting(); err != nil {
+		return false, err
 	}
 	r.joining[a] = true
 	return false, nil
+}
+
+func (r *rt) leaveJoin(a *array) {
+	delete(r.joining, a)
+	r.leaveNesting()
 }
 
 // join implements Array.prototype.join, guarding against cyclic arrays the
@@ -479,7 +477,7 @@ func (r *rt) join(a *array, sep string) (string, error) {
 	if cycle, err := r.enterJoin(a); cycle || err != nil {
 		return "", err
 	}
-	defer delete(r.joining, a)
+	defer r.leaveJoin(a)
 	var b strings.Builder
 	for i, v := range a.items {
 		if i > 0 {

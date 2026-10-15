@@ -98,7 +98,8 @@ type execution struct {
 type rt struct {
 	ctx     context.Context
 	x       *execution
-	joining map[*array]bool
+	joining map[*array]bool // arrays being converted by join/toLocaleString (cycle guard)
+	nesting int             // conversion levels active on this stack (see enterNesting)
 	depth   int
 	pending int // steps not yet published to x.steps
 	frames  []*scope8
@@ -117,6 +118,10 @@ type Throw struct {
 	text  *string // ToString(Value) when it ran script code (own toString)
 }
 
+// Error has no live runtime (the host usually calls it after the script has
+// finished), so it renders the thrown value with the bounded detached
+// formatter (see errorToString): a cyclic or deeply nested thrown value cannot
+// overflow the host's stack when the host formats the error.
 func (t *Throw) Error() string {
 	if t.cause != nil {
 		return t.cause.Error()
@@ -133,12 +138,10 @@ func (t *Throw) Error() string {
 	case string:
 		return v
 	}
-	r := &rt{x: &execution{maxString: 1 << 20}}
-	s, err := r.toString(t.Value)
-	if err != nil {
-		return "exception"
+	if s, ok := detachedString(t.Value); ok {
+		return s
 	}
-	return s
+	return "exception"
 }
 
 func (t *Throw) Unwrap() error { return t.cause }
