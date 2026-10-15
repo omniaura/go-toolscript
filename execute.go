@@ -538,7 +538,13 @@ func (r *rt) effect(counter *atomic.Int64, limit int, label string, dispatch fun
 
 // fromGo converts host (Dispatch) data into runtime values. Object keys from
 // Go maps have no order, so they enumerate sorted (Goja's order is random).
-func fromGo(v any) (any, error) {
+func fromGo(v any) (any, error) { return fromGoDepth(v, 0) }
+
+// fromGoDepth bounds the nesting it descends: a tool or host dispatcher that
+// returns data nested past maxConversionNesting would otherwise recurse once
+// per level until the goroutine stack overflows fatally, which recover()
+// cannot catch. It fails the conversion instead.
+func fromGoDepth(v any, depth int) (any, error) {
 	switch v := v.(type) {
 	case nil, bool, float64, string, undefined:
 		return v, nil
@@ -556,6 +562,9 @@ func fromGo(v any) (any, error) {
 		f, err := v.Float64()
 		return f, err
 	case map[string]any:
+		if depth >= maxConversionNesting {
+			return nil, errStackOverflow
+		}
 		keys := make([]string, 0, len(v))
 		for k := range v {
 			keys = append(keys, k)
@@ -563,7 +572,7 @@ func fromGo(v any) (any, error) {
 		sort.Strings(keys)
 		o := newObject(len(v))
 		for _, k := range keys {
-			c, err := fromGo(v[k])
+			c, err := fromGoDepth(v[k], depth+1)
 			if err != nil {
 				return nil, err
 			}
@@ -571,9 +580,12 @@ func fromGo(v any) (any, error) {
 		}
 		return o, nil
 	case []any:
+		if depth >= maxConversionNesting {
+			return nil, errStackOverflow
+		}
 		items := make([]any, len(v))
 		for i, e := range v {
-			c, err := fromGo(e)
+			c, err := fromGoDepth(e, depth+1)
 			if err != nil {
 				return nil, err
 			}
@@ -581,6 +593,9 @@ func fromGo(v any) (any, error) {
 		}
 		return &array{items: items}, nil
 	case *Object:
+		if depth >= maxConversionNesting {
+			return nil, errStackOverflow
+		}
 		view := newObject(len(v.Fields))
 		keys := v.Order
 		if keys == nil {
@@ -594,7 +609,7 @@ func fromGo(v any) (any, error) {
 			if !ok {
 				continue
 			}
-			c, err := fromGo(f)
+			c, err := fromGoDepth(f, depth+1)
 			if err != nil {
 				return nil, err
 			}

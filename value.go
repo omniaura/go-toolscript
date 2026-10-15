@@ -441,16 +441,44 @@ func errorToString(o *object) string {
 	return ns + ": " + ms
 }
 
-// join implements Array.prototype.join, guarding against cyclic arrays the
-// same way engines do (a cycle renders as the empty string).
-func (r *rt) join(a *array, sep string) (string, error) {
+// maxConversionNesting bounds how deeply the value-conversion builtins
+// (join/toString, toLocaleString, flat) and the host-data converter (fromGo)
+// descend through nested arrays and objects. Each level is a Go stack frame,
+// and a script can nest containers millions deep within its step budget; past
+// the goroutine stack limit that is a fatal runtime error the host process
+// cannot recover(), not a catchable panic. Engines instead throw a RangeError,
+// and this matches the 10000-level limit JSON.stringify (stringifier.str),
+// Marshal (jsonValue) and encoding/json's own JSON.parse decoder enforce.
+const maxConversionNesting = 10000
+
+// enterJoin marks array a as being converted and reports a cycle (which
+// engines render as the empty string) or throws past maxConversionNesting.
+// join and toLocaleString share r.joining, so mixed nesting shares one bound;
+// len(r.joining) is the current conversion depth because every active frame
+// has exactly one entry on the map that its deferred delete removes on return.
+// On success (cycle == false, err == nil) the caller must delete a from
+// r.joining when it is done.
+func (r *rt) enterJoin(a *array) (cycle bool, err error) {
 	if r.joining == nil {
 		r.joining = map[*array]bool{}
 	}
 	if r.joining[a] {
-		return "", nil
+		return true, nil
+	}
+	if len(r.joining) >= maxConversionNesting {
+		return false, r.rangeError("Maximum call stack size exceeded")
 	}
 	r.joining[a] = true
+	return false, nil
+}
+
+// join implements Array.prototype.join, guarding against cyclic arrays the
+// same way engines do (a cycle renders as the empty string) and bounding the
+// nesting depth it recurses through toString (see maxConversionNesting).
+func (r *rt) join(a *array, sep string) (string, error) {
+	if cycle, err := r.enterJoin(a); cycle || err != nil {
+		return "", err
+	}
 	defer delete(r.joining, a)
 	var b strings.Builder
 	for i, v := range a.items {
