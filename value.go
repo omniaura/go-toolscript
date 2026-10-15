@@ -37,6 +37,29 @@ type function struct {
 	props  *object // own properties assigned by the script (fn.state = ...)
 	name   string
 	length int // .length of native functions (bound functions)
+	// binds counts the Function.prototype.bind calls that produced this
+	// function (0 for any other function). Its name is then "bound "
+	// repeated binds times before name; displayName builds it on demand.
+	binds int
+}
+
+// maxBindNesting bounds a bind chain (f.bind().bind()...); binding a function
+// already this deep throws a catchable RangeError. A bound function keeps only
+// its target's name and a count, and calling one counts each bound level
+// toward MaxCallDepth (callThis), so a chain costs memory linear in its
+// length; the bound keeps the name displayName builds, "bound " per level,
+// small. V8 has no such limit, but no script needs ten thousand binds.
+const maxBindNesting = 10000
+
+// displayName is the function's name property. A bound function stores its
+// target's name and a bind count rather than the concatenated "bound bound
+// ... f": storing each level's full name made a bind chain cost memory
+// quadratic in its length.
+func (f *function) displayName() string {
+	if f.binds == 0 {
+		return f.name
+	}
+	return strings.Repeat("bound ", f.binds) + f.name
 }
 
 // hostObject exposes a host Object's property view while preserving its
@@ -413,7 +436,7 @@ func (r *rt) toString(v any) (string, error) {
 		return r.dateString(v, dateTimeLayout, false), nil
 	case *function:
 		if v.native != nil {
-			return "function " + v.name + "() { [native code] }", nil
+			return "function " + v.displayName() + "() { [native code] }", nil
 		}
 		return v.code.source, nil
 	}
@@ -801,7 +824,7 @@ func (r *rt) getProp(v any, key string) (any, error) {
 		}
 		switch key {
 		case "name":
-			return v.name, nil
+			return v.displayName(), nil
 		case "length":
 			if v.code != nil {
 				return float64(v.code.length), nil

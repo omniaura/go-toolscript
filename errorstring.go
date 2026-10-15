@@ -199,7 +199,7 @@ func (d *detached) value(v any) bool {
 		}
 	case *function:
 		if t.native != nil {
-			d.write("function " + t.name + "() { [native code] }")
+			d.write("function " + t.displayName() + "() { [native code] }")
 		} else {
 			d.write(t.code.source)
 		}

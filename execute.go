@@ -425,7 +425,21 @@ func (r *rt) callThis(f any, this any, args []any) (any, error) {
 		return nil, r.notCallable(f)
 	}
 	if fn.native != nil {
-		return fn.native(r, this, args)
+		if fn.binds == 0 {
+			return fn.native(r, this, args)
+		}
+		// A bound function calls its target through callThis again: one
+		// more Go frame per bind level that invoke's depth accounting never
+		// sees. Count each level toward MaxCallDepth like a script call, so
+		// a long bind chain fails like deep recursion instead of growing the
+		// goroutine stack without limit.
+		if r.depth >= r.x.maxDepth {
+			return nil, errStackOverflow
+		}
+		r.depth++
+		v, err := fn.native(r, this, args)
+		r.depth--
+		return v, err
 	}
 	return r.invoke(fn, args)
 }

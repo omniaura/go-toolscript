@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"reflect"
 	"regexp"
+	"runtime"
 	"runtime/debug"
 	"strings"
 	"testing"
@@ -459,6 +460,72 @@ func TestErrorTextWithinBoundUnchanged(t *testing.T) {
 			}
 			if tc.console != "" && (len(lines) != 1 || lines[0] != tc.console) {
 				t.Fatalf("got console %q, want [%q]", lines, tc.console)
+			}
+		})
+	}
+}
+
+// TestBindChainsAreBounded covers Function.prototype.bind chains. Calling a
+// bound function re-entered callThis once per bind level without counting
+// toward MaxCallDepth, so a long chain recursed in Go with no limit, and each
+// level stored its whole "bound bound ... f" name, so a chain cost memory
+// quadratic in its length (20000 binds held about 1.2 GB).
+func TestBindChainsAreBounded(t *testing.T) {
+	t.Run("call-counts-toward-MaxCallDepth", func(t *testing.T) {
+		inChild(t, func(t *testing.T) {
+			res, err := runScript(t, `let f = () => 1; for (let i = 0; i < 5000; i++) f = f.bind(null); return f();`)
+			if err == nil || !strings.Contains(err.Error(), "Maximum call stack size exceeded") {
+				t.Fatalf("got value=%#v err=%v, want the call depth limit", res.Value, err)
+			}
+		})
+	})
+	t.Run("nesting-is-capped", func(t *testing.T) {
+		inChild(t, func(t *testing.T) {
+			res, err := runScript(t, `function g() {} let f = g; try { for (let i = 0; i <= 10000; i++) f = f.bind(null); return "no throw"; } catch (e) { return e.name + ":" + f.name.length; }`)
+			want := "RangeError:" + itoa(len("bound ")*maxBindNesting+len("g"))
+			if err != nil || res.Value != want {
+				t.Fatalf("got value=%#v err=%v, want %q", res.Value, err, want)
+			}
+		})
+	})
+	t.Run("memory-is-linear", func(t *testing.T) {
+		inChild(t, func(t *testing.T) {
+			var before, during runtime.MemStats
+			runtime.GC()
+			runtime.ReadMemStats(&before)
+			// The tool call measures the live heap while the chain is alive.
+			res, err := runWith(t, `function g() {} let f = g; for (let i = 0; i < 10000; i++) f = f.bind(null); mcp.probe({}); return f.name.length;`, ExecuteOptions{
+				Dispatch: func(context.Context, string, any) (any, error) {
+					runtime.GC()
+					runtime.ReadMemStats(&during)
+					return nil, nil
+				},
+			})
+			if err != nil || res.Value != float64(len("bound ")*10000+len("g")) {
+				t.Fatalf("got value=%#v err=%v", res.Value, err)
+			}
+			// Each level holding its full name took about 300 MB here.
+			if grew := int64(during.HeapAlloc) - int64(before.HeapAlloc); grew > 32<<20 {
+				t.Fatalf("a 10000-level bind chain grew the live heap by %d MB, want under 32 MB", grew>>20)
+			}
+		})
+	})
+	// Positive controls: ordinary bound functions behave as before.
+	for _, tc := range []struct {
+		name, src string
+		want      any
+	}{
+		{"name-length-call-source", `function g(a, b) { return a + b; } const h = g.bind(null, 1).bind(null); return [h.name, h.length, h(2), String(h)];`, []any{"bound bound g", float64(1), float64(3), "function bound bound g() { [native code] }"}},
+		{"anonymous-target", `const h = (() => 1).bind(null); return [h.name, h()];`, []any{"bound ", float64(1)}},
+		{"chain-within-MaxCallDepth", `function g(a, b) { return a + b; } let f = g.bind(null, 1); for (let i = 0; i < 500; i++) f = f.bind(null); return [f(2), f.name === "bound ".repeat(501) + "g"];`, []any{float64(3), true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res, err := runScript(t, tc.src)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !reflect.DeepEqual(res.Value, tc.want) {
+				t.Fatalf("got %#v, want %#v", res.Value, tc.want)
 			}
 		})
 	}

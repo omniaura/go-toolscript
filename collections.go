@@ -333,6 +333,9 @@ func (r *rt) functionMethod(f *function, key string, args []any) (any, bool, err
 		v, err := r.callThis(f, arg(args, 0), items)
 		return v, true, err
 	case "bind":
+		if f.binds >= maxBindNesting {
+			return nil, true, r.rangeError("Maximum call stack size exceeded")
+		}
 		var bound []any
 		if len(args) > 1 {
 			bound = append(bound, args[1:]...)
@@ -344,7 +347,8 @@ func (r *rt) functionMethod(f *function, key string, args []any) (any, bool, err
 			length = max(0, f.length-len(bound))
 		}
 		boundThis := arg(args, 0)
-		return &function{name: "bound " + f.name, length: length, native: func(r *rt, _ any, more []any) (any, error) {
+		// The name is f's name with one more "bound " (see displayName).
+		return &function{name: f.name, binds: f.binds + 1, length: length, native: func(r *rt, _ any, more []any) (any, error) {
 			return r.callThis(f, boundThis, append(append([]any{}, bound...), more...))
 		}}, true, nil
 	}
