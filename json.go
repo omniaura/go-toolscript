@@ -276,7 +276,7 @@ func quoteJSON(b *strings.Builder, s string) {
 // parseJSON ports Goja's token-based JSON.parse (same errors and order).
 func (r *rt) parseJSON(s string) (any, error) {
 	d := json.NewDecoder(strings.NewReader(s))
-	v, err := r.decodeJSON(d)
+	v, err := r.decodeJSON(d, 0)
 	if errors.Is(err, io.EOF) {
 		return nil, r.syntaxError("Unexpected end of JSON input (" + err.Error() + ")")
 	}
@@ -309,17 +309,23 @@ func tokenString(tok json.Token) string {
 	return reflect.TypeOf(tok).String()
 }
 
-func (r *rt) decodeJSON(d *json.Decoder) (any, error) {
+func (r *rt) decodeJSON(d *json.Decoder, depth int) (any, error) {
 	tok, err := d.Token()
 	if err != nil {
 		return nil, err
 	}
-	return r.decodeToken(d, tok)
+	return r.decodeToken(d, tok, depth)
 }
 
-func (r *rt) decodeToken(d *json.Decoder, tok json.Token) (any, error) {
+// decodeToken recurses once per level of nesting, so it is bounded by
+// maxConversionNesting itself rather than relying on the standard library:
+// json.Decoder's streaming Token() caps depth only on some Go releases.
+func (r *rt) decodeToken(d *json.Decoder, tok json.Token, depth int) (any, error) {
 	switch t := tok.(type) {
 	case json.Delim:
+		if depth >= maxConversionNesting {
+			return nil, errors.New("exceeded max depth")
+		}
 		switch t {
 		case '{':
 			o := newObject(4)
@@ -335,7 +341,7 @@ func (r *rt) decodeToken(d *json.Decoder, tok json.Token) (any, error) {
 				if !ok {
 					return nil, errors.New("Unexpected token")
 				}
-				v, err := r.decodeJSON(d)
+				v, err := r.decodeJSON(d, depth+1)
 				if err != nil {
 					return nil, err
 				}
@@ -351,7 +357,7 @@ func (r *rt) decodeToken(d *json.Decoder, tok json.Token) (any, error) {
 				if tok == json.Delim(']') {
 					return &array{items: items}, nil
 				}
-				v, err := r.decodeToken(d, tok)
+				v, err := r.decodeToken(d, tok, depth+1)
 				if err != nil {
 					return nil, err
 				}

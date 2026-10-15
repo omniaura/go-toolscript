@@ -98,7 +98,8 @@ type execution struct {
 type rt struct {
 	ctx     context.Context
 	x       *execution
-	joining map[*array]bool
+	joining map[*array]bool // arrays being converted by join/toLocaleString (cycle guard)
+	nesting int             // conversion levels active on this stack (see enterNesting)
 	depth   int
 	pending int // steps not yet published to x.steps
 	frames  []*scope8
@@ -117,6 +118,10 @@ type Throw struct {
 	text  *string // ToString(Value) when it ran script code (own toString)
 }
 
+// Error has no live runtime (the host usually calls it after the script has
+// finished), so it renders the thrown value with the bounded detached
+// formatter (see errorToString): a cyclic or deeply nested thrown value cannot
+// overflow the host's stack when the host formats the error.
 func (t *Throw) Error() string {
 	if t.cause != nil {
 		return t.cause.Error()
@@ -133,12 +138,10 @@ func (t *Throw) Error() string {
 	case string:
 		return v
 	}
-	r := &rt{x: &execution{maxString: 1 << 20}}
-	s, err := r.toString(t.Value)
-	if err != nil {
-		return "exception"
+	if s, ok := detachedString(t.Value); ok {
+		return s
 	}
-	return s
+	return "exception"
 }
 
 func (t *Throw) Unwrap() error { return t.cause }
@@ -422,7 +425,21 @@ func (r *rt) callThis(f any, this any, args []any) (any, error) {
 		return nil, r.notCallable(f)
 	}
 	if fn.native != nil {
-		return fn.native(r, this, args)
+		if fn.binds == 0 {
+			return fn.native(r, this, args)
+		}
+		// A bound function calls its target through callThis again: one
+		// more Go frame per bind level that invoke's depth accounting never
+		// sees. Count each level toward MaxCallDepth like a script call, so
+		// a long bind chain fails like deep recursion instead of growing the
+		// goroutine stack without limit.
+		if r.depth >= r.x.maxDepth {
+			return nil, errStackOverflow
+		}
+		r.depth++
+		v, err := fn.native(r, this, args)
+		r.depth--
+		return v, err
 	}
 	return r.invoke(fn, args)
 }
@@ -538,7 +555,13 @@ func (r *rt) effect(counter *atomic.Int64, limit int, label string, dispatch fun
 
 // fromGo converts host (Dispatch) data into runtime values. Object keys from
 // Go maps have no order, so they enumerate sorted (Goja's order is random).
-func fromGo(v any) (any, error) {
+func fromGo(v any) (any, error) { return fromGoDepth(v, 0) }
+
+// fromGoDepth bounds the nesting it descends: a tool or host dispatcher that
+// returns data nested past maxConversionNesting would otherwise recurse once
+// per level until the goroutine stack overflows fatally, which recover()
+// cannot catch. It fails the conversion instead.
+func fromGoDepth(v any, depth int) (any, error) {
 	switch v := v.(type) {
 	case nil, bool, float64, string, undefined:
 		return v, nil
@@ -556,6 +579,9 @@ func fromGo(v any) (any, error) {
 		f, err := v.Float64()
 		return f, err
 	case map[string]any:
+		if depth >= maxConversionNesting {
+			return nil, errStackOverflow
+		}
 		keys := make([]string, 0, len(v))
 		for k := range v {
 			keys = append(keys, k)
@@ -563,7 +589,7 @@ func fromGo(v any) (any, error) {
 		sort.Strings(keys)
 		o := newObject(len(v))
 		for _, k := range keys {
-			c, err := fromGo(v[k])
+			c, err := fromGoDepth(v[k], depth+1)
 			if err != nil {
 				return nil, err
 			}
@@ -571,9 +597,12 @@ func fromGo(v any) (any, error) {
 		}
 		return o, nil
 	case []any:
+		if depth >= maxConversionNesting {
+			return nil, errStackOverflow
+		}
 		items := make([]any, len(v))
 		for i, e := range v {
-			c, err := fromGo(e)
+			c, err := fromGoDepth(e, depth+1)
 			if err != nil {
 				return nil, err
 			}
@@ -581,6 +610,9 @@ func fromGo(v any) (any, error) {
 		}
 		return &array{items: items}, nil
 	case *Object:
+		if depth >= maxConversionNesting {
+			return nil, errStackOverflow
+		}
 		view := newObject(len(v.Fields))
 		keys := v.Order
 		if keys == nil {
@@ -594,7 +626,7 @@ func fromGo(v any) (any, error) {
 			if !ok {
 				continue
 			}
-			c, err := fromGo(f)
+			c, err := fromGoDepth(f, depth+1)
 			if err != nil {
 				return nil, err
 			}

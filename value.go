@@ -37,6 +37,29 @@ type function struct {
 	props  *object // own properties assigned by the script (fn.state = ...)
 	name   string
 	length int // .length of native functions (bound functions)
+	// binds counts the Function.prototype.bind calls that produced this
+	// function (0 for any other function). Its name is then "bound "
+	// repeated binds times before name; displayName builds it on demand.
+	binds int
+}
+
+// maxBindNesting bounds a bind chain (f.bind().bind()...); binding a function
+// already this deep throws a catchable RangeError. A bound function keeps only
+// its target's name and a count, and calling one counts each bound level
+// toward MaxCallDepth (callThis), so a chain costs memory linear in its
+// length; the bound keeps the name displayName builds, "bound " per level,
+// small. V8 has no such limit, but no script needs ten thousand binds.
+const maxBindNesting = 10000
+
+// displayName is the function's name property. A bound function stores its
+// target's name and a bind count rather than the concatenated "bound bound
+// ... f": storing each level's full name made a bind chain cost memory
+// quadratic in its length.
+func (f *function) displayName() string {
+	if f.binds == 0 {
+		return f.name
+	}
+	return strings.Repeat("bound ", f.binds) + f.name
 }
 
 // hostObject exposes a host Object's property view while preserving its
@@ -320,7 +343,7 @@ func (r *rt) toPrimitiveHint(v any, hint string) (any, error) {
 				fv, own := t.own(m)
 				if !own {
 					if m == "toString" {
-						return r.defaultObjectString(t), nil
+						return r.defaultObjectString(t)
 					}
 					continue // Object.prototype.valueOf returns the object
 				}
@@ -338,7 +361,7 @@ func (r *rt) toPrimitiveHint(v any, hint string) (any, error) {
 			}
 			return nil, r.typeError("Cannot convert object to primitive value")
 		}
-		return r.defaultObjectString(t), nil
+		return r.defaultObjectString(t)
 	case *dateValue:
 		// Date's @@toPrimitive: "number" gives the time value, else a string.
 		if hint == "number" {
@@ -363,11 +386,11 @@ func userConversion(o *object) bool {
 	return s || v
 }
 
-func (r *rt) defaultObjectString(o *object) string {
+func (r *rt) defaultObjectString(o *object) (string, error) {
 	if o.errName != "" {
-		return errorToString(o)
+		return r.errorString(o)
 	}
-	return "[object Object]"
+	return "[object Object]", nil
 }
 
 func (r *rt) toString(v any) (string, error) {
@@ -395,7 +418,7 @@ func (r *rt) toString(v any) (string, error) {
 			}
 			return r.toString(p)
 		}
-		return r.defaultObjectString(v), nil
+		return r.defaultObjectString(v)
 	case *hostObject:
 		return "[object Object]", nil
 	case *regexpValue:
@@ -413,45 +436,71 @@ func (r *rt) toString(v any) (string, error) {
 		return r.dateString(v, dateTimeLayout, false), nil
 	case *function:
 		if v.native != nil {
-			return "function " + v.name + "() { [native code] }", nil
+			return "function " + v.displayName() + "() { [native code] }", nil
 		}
 		return v.code.source, nil
 	}
 	return "", errInternal
 }
 
-// errorToString implements Error.prototype.toString for our error objects.
-func errorToString(o *object) string {
-	r := &rt{x: &execution{maxString: 1 << 20}}
-	name, _ := o.get("name")
-	msg, _ := o.get("message")
-	ns, ms := "Error", ""
-	if !isUndefined(name) {
-		ns, _ = r.toString(name)
+// maxConversionNesting bounds how deeply the value-conversion builtins
+// (join/toString, toLocaleString, Error.prototype.toString, flat), JSON.parse
+// (decodeToken) and the host-data converter (fromGo) descend through nested
+// values. Each level is a Go stack frame, and a script can nest containers
+// millions deep within its step budget; past the goroutine stack limit that is
+// a fatal runtime error the host process cannot recover(), not a catchable
+// panic. Engines instead throw a RangeError. JSON.stringify
+// (stringifier.str) and Marshal (jsonValue) enforce the same 10000 levels.
+const maxConversionNesting = 10000
+
+// enterNesting takes one level of the conversion budget that join,
+// toLocaleString and errorString share: r.nesting counts the conversion levels
+// active on this goroutine's stack, so nesting that alternates between arrays
+// and Errors (or runs through a script toString in between) is bounded as one
+// recursion. Past maxConversionNesting it throws a RangeError. On success the
+// caller must call leaveNesting when that level returns.
+func (r *rt) enterNesting() error {
+	if r.nesting >= maxConversionNesting {
+		return r.rangeError("Maximum call stack size exceeded")
 	}
-	if !isUndefined(msg) {
-		ms, _ = r.toString(msg)
-	}
-	if ns == "" {
-		return ms
-	}
-	if ms == "" {
-		return ns
-	}
-	return ns + ": " + ms
+	r.nesting++
+	return nil
 }
 
-// join implements Array.prototype.join, guarding against cyclic arrays the
-// same way engines do (a cycle renders as the empty string).
-func (r *rt) join(a *array, sep string) (string, error) {
+func (r *rt) leaveNesting() { r.nesting-- }
+
+// enterJoin marks array a as being converted and reports a cycle (which
+// engines render as the empty string) or throws past maxConversionNesting.
+// join and toLocaleString share r.joining and the r.nesting budget. On success
+// (cycle == false, err == nil) the caller must call leaveJoin(a) when it is
+// done.
+func (r *rt) enterJoin(a *array) (cycle bool, err error) {
 	if r.joining == nil {
 		r.joining = map[*array]bool{}
 	}
 	if r.joining[a] {
-		return "", nil
+		return true, nil
+	}
+	if err := r.enterNesting(); err != nil {
+		return false, err
 	}
 	r.joining[a] = true
-	defer delete(r.joining, a)
+	return false, nil
+}
+
+func (r *rt) leaveJoin(a *array) {
+	delete(r.joining, a)
+	r.leaveNesting()
+}
+
+// join implements Array.prototype.join, guarding against cyclic arrays the
+// same way engines do (a cycle renders as the empty string) and bounding the
+// nesting depth it recurses through toString (see maxConversionNesting).
+func (r *rt) join(a *array, sep string) (string, error) {
+	if cycle, err := r.enterJoin(a); cycle || err != nil {
+		return "", err
+	}
+	defer r.leaveJoin(a)
 	var b strings.Builder
 	for i, v := range a.items {
 		if i > 0 {
@@ -775,7 +824,7 @@ func (r *rt) getProp(v any, key string) (any, error) {
 		}
 		switch key {
 		case "name":
-			return v.name, nil
+			return v.displayName(), nil
 		case "length":
 			if v.code != nil {
 				return float64(v.code.length), nil

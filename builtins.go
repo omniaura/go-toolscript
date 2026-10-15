@@ -349,7 +349,7 @@ func init() {
 				depth = toIntegerOrInfinity(d)
 			}
 			out := []any{}
-			if err := r.flatten(&out, a.items, depth); err != nil {
+			if err := r.flatten(&out, a.items, depth, 0); err != nil {
 				return nil, err
 			}
 			return &array{items: out}, nil
@@ -440,6 +440,17 @@ func init() {
 		"keys":     func(r *rt, a *array, args []any) (any, error) { return arrayIterator(a, "keys"), nil },
 		"values":   func(r *rt, a *array, args []any) (any, error) { return arrayIterator(a, "values"), nil },
 		"toLocaleString": func(r *rt, a *array, args []any) (any, error) {
+			// A nested array converts through this method again, and a cyclic
+			// array would recurse forever, so it shares join's cycle guard and
+			// nesting bound keyed on the original array (the parts array built
+			// below is fresh each level, so join's own guard cannot see the
+			// cycle). See maxConversionNesting.
+			if cycle, err := r.enterJoin(a); err != nil {
+				return nil, err
+			} else if cycle {
+				return "", nil
+			}
+			defer r.leaveJoin(a)
 			parts := make([]any, len(a.items))
 			for i, v := range a.items {
 				if isNullish(v) {
@@ -1394,13 +1405,21 @@ func iterateArrayReverse(r *rt, a *array, args []any, visit func(v, res any, i i
 	return def, nil
 }
 
-func (r *rt) flatten(out *[]any, items []any, depth float64) error {
+// flatten appends items to out, descending at most depth levels. nesting is
+// how many levels have already been descended: flat(Infinity) on a deeply
+// nested (or cyclic) array would otherwise recurse once per level until the
+// goroutine stack overflows fatally, so it throws a RangeError past
+// maxConversionNesting the way engines do.
+func (r *rt) flatten(out *[]any, items []any, depth float64, nesting int) error {
 	for _, v := range items {
 		if isHole(v) {
 			continue
 		}
 		if b, ok := v.(*array); ok && depth > 0 {
-			if err := r.flatten(out, b.items, depth-1); err != nil {
+			if nesting >= maxConversionNesting {
+				return r.rangeError("Maximum call stack size exceeded")
+			}
+			if err := r.flatten(out, b.items, depth-1, nesting+1); err != nil {
 				return err
 			}
 			continue

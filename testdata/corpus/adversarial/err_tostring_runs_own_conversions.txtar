@@ -1,0 +1,15 @@
+Error toString converts an object name or message with its own toString, and an exception from it propagates.
+-- script.js --
+const e = new Error("m");
+e.name = { toString() { return "Custom"; } };
+const f = new Error("n");
+f.message = { toString() { return "from toString"; } };
+const g = new Error("g");
+g.name = { toString() { throw new TypeError("name boom"); } };
+let caught = "none";
+try { String(g); } catch (x) { caught = x.name + ": " + x.message; }
+const h = new Error("outer");
+h.message = new RangeError("inner");
+return [String(e), String(f), `${f}`, caught, String(h)];
+-- tools.json --
+{}
