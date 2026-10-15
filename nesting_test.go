@@ -72,12 +72,11 @@ func TestDeepConversionsThrowRangeError(t *testing.T) {
 	}
 }
 
-// TestDeepJSONParseIsBounded documents that JSON.parse is NOT a fatal vector,
-// even though decodeToken recurses once per level of nesting: the standard
-// library's streaming json.Decoder caps nesting at its own maxNestingDepth and
-// returns a SyntaxError well short of a stack overflow, so a deeply nested JSON
-// string fails cleanly rather than crashing the process. (The go.mod toolchain
-// floor, go 1.25, is the first release with that Decoder limit.)
+// TestDeepJSONParseIsBounded: decodeToken recurses once per level of nesting,
+// so it stops at maxConversionNesting itself with a SyntaxError instead of
+// recursing until the goroutine stack is exhausted. It must not rely on the
+// standard library: json.Decoder's streaming Token() enforces a depth cap on
+// some Go releases and not on others (Go 1.26 parses 20000 levels here).
 func TestDeepJSONParseIsBounded(t *testing.T) {
 	src := `const s = "[".repeat(20000) + "]".repeat(20000); return JSON.parse(s).length;`
 	res, err := runScript(t, src)
